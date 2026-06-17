@@ -185,6 +185,58 @@ body {
   50% { transform: scale(1.15); }
 }
 
+/* gradient text helper */
+.text-gradient {
+  background: linear-gradient(90deg, #5eead4, #c084fc, #ec4899);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* animated marquee */
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+.marquee-track {
+  display: flex;
+  width: max-content;
+  animation: marquee 28s linear infinite;
+}
+.marquee-track:hover { animation-play-state: paused; }
+
+/* magnetic spotlight card */
+.spotlight-card {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.spotlight-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  background: radial-gradient(
+    320px circle at var(--mx, 50%) var(--my, 50%),
+    rgba(255, 255, 255, 0.08),
+    transparent 60%
+  );
+}
+.spotlight-card:hover::before { opacity: 1; }
+
+/* shimmering divider */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+/* reduce motion */
+@media (prefers-reduced-motion: reduce) {
+  .mind-orb, .btn-pulse, .marquee-track, .aurora-orb { animation: none !important; }
+}
+
 /* prevent visual edit wrapper layout shifts */
 [data-debug-wrapper="true"] { display: contents !important; }
 

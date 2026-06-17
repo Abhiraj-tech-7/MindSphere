@@ -1,0 +1,17 @@
+{
+  "name": "mindsphere",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MindSphere — AI-powered mental wellness platform (React frontend + FastAPI backend)",
+  "scripts": {
+    "dev": "cd frontend && craco start",
+    "start": "cd frontend && craco start",
+    "build": "cd frontend && craco build",
+    "test": "cd frontend && craco test",
+    "install:frontend": "cd frontend && yarn install",
+    "backend": "cd backend && uvicorn server:app --reload --port 8000"
+  },
+  "workspaces": [
+    "frontend"
+  ]
+}

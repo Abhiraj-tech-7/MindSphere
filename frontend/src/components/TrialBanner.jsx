@@ -1,56 +1,68 @@
-import React from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useEffect, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Sparkles, X } from "lucide-react";
+import { X } from "lucide-react";
+import { http } from "../lib/api";
 import { useAuth } from "../lib/auth.jsx";
-import { toast } from "sonner";
 
 /**
- * Slim top banner shown in the last 3 days of trial OR when subscription expired.
+ * Trial countdown banner — shown when trial_days_remaining <= 3.
+ * Hidden on /auth, /onboarding, /pricing, /welcome.
  * Dismissable per session via sessionStorage.
- * Also listens for global 'ms:pro_required' events from axios interceptor.
  */
+const HIDE_PATHS = ["/auth", "/onboarding", "/pricing", "/welcome"];
+
 const TrialBanner = () => {
   const { user } = useAuth();
+  const loc = useLocation();
   const nav = useNavigate();
-  const [dismissed, setDismissed] = React.useState(() => sessionStorage.getItem("ms_trial_dismissed") === "1");
+  const [status, setStatus] = useState(null);
+  const [dismissed, setDismissed] = useState(false);
 
-  React.useEffect(() => {
-    const onProRequired = () => {
-      toast("This feature is part of MindSphere Pro.", {
-        icon: "✨",
-        action: { label: "Upgrade", onClick: () => nav("/pricing") },
-      });
+  useEffect(() => {
+    if (sessionStorage.getItem("ms_trial_banner_dismissed") === "1") setDismissed(true);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (!user) { setStatus(null); return; }
+      try {
+        const { data } = await http.get("/billing/status");
+        if (!cancelled) setStatus(data);
+      } catch {
+        if (!cancelled) setStatus(null);
+      }
     };
-    window.addEventListener("ms:pro_required", onProRequired);
-    return () => window.removeEventListener("ms:pro_required", onProRequired);
-  }, [nav]);
+    load();
+    return () => { cancelled = true; };
+  }, [user]);
 
-  const sub = user?.subscription_state;
-  if (!sub) return null;
+  const dismiss = () => {
+    sessionStorage.setItem("ms_trial_banner_dismissed", "1");
+    setDismissed(true);
+  };
+
+  if (!user || dismissed || !status) return null;
+  if (HIDE_PATHS.some((p) => loc.pathname.startsWith(p))) return null;
+
+  const isTrial = status.plan === "trial";
+  const isFree = status.plan === "free";
+  const days = status.trial_days_remaining;
 
   let show = false;
   let message = "";
-  let cta = "Upgrade to Pro";
-  let tone = "warning";
-
-  if (sub.status === "trial" && sub.trial_days_left <= 3 && sub.trial_days_left > 0) {
+  if (isTrial && days !== null && days <= 3) {
     show = true;
-    message = `${sub.trial_days_left} ${sub.trial_days_left === 1 ? "day" : "days"} left in your free trial`;
-    cta = "Upgrade now";
-  } else if (sub.status === "expired") {
+    message = days <= 0
+      ? "Your free trial has ended today — upgrade to continue using Lyra and all Pro features."
+      : `⏳ ${days} day${days === 1 ? "" : "s"} left in your free trial — unlock everything for $14.99/month`;
+  } else if (isFree) {
     show = true;
-    message = "Your free trial has ended — upgrade to keep your MindSphere flowing.";
-    cta = "See plans";
-    tone = "expired";
+    message = "Your free trial has ended — upgrade to continue using Lyra and all Pro features.";
   }
 
-  if (!show || dismissed) return null;
-
-  const close = () => {
-    sessionStorage.setItem("ms_trial_dismissed", "1");
-    setDismissed(true);
-  };
+  if (!show) return null;
 
   return (
     <AnimatePresence>
@@ -58,31 +70,26 @@ const TrialBanner = () => {
         initial={{ y: -40, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
         exit={{ y: -40, opacity: 0 }}
-        className="fixed top-0 left-0 right-0 z-[80] flex items-center justify-center px-3 py-2.5"
-        style={{
-          background: tone === "expired"
-            ? "linear-gradient(90deg, rgba(239,68,68,0.18), rgba(199,110,255,0.18))"
-            : "linear-gradient(90deg, rgba(199,110,255,0.18), rgba(236,72,153,0.18))",
-          borderBottom: "1px solid rgba(255,255,255,0.06)",
-          backdropFilter: "blur(12px)",
-        }}
+        className="sticky top-0 z-[60] w-full text-sm flex items-center justify-center gap-3 px-4 py-2.5 text-black"
+        style={{ background: "linear-gradient(90deg, #fbbf24, #f97316)" }}
         data-testid="trial-banner"
       >
-        <div className="flex items-center gap-3 text-sm">
-          <Sparkles size={14} className="text-purple-300" />
-          <span className="text-white/85">{message}</span>
-          <button
-            onClick={() => nav("/pricing")}
-            data-testid="trial-banner-cta"
-            className="ml-2 px-3 py-1 rounded-full text-xs font-medium hover:scale-[1.03] transition"
-            style={{ background: "linear-gradient(90deg,#a78bfa,#ec4899)", color: "white" }}
-          >
-            {cta}
-          </button>
-          <button onClick={close} aria-label="dismiss" className="text-white/40 hover:text-white ml-1">
-            <X size={14} />
-          </button>
-        </div>
+        <span className="font-medium text-center text-xs sm:text-sm">{message}</span>
+        <button
+          onClick={() => nav("/pricing")}
+          data-testid="trial-banner-cta"
+          className="px-3 py-1 rounded-full bg-black/15 hover:bg-black/25 transition text-xs font-medium whitespace-nowrap"
+        >
+          Upgrade Now →
+        </button>
+        <button
+          onClick={dismiss}
+          aria-label="Dismiss"
+          data-testid="trial-banner-dismiss"
+          className="w-6 h-6 rounded-full flex items-center justify-center hover:bg-black/15"
+        >
+          <X size={12} />
+        </button>
       </motion.div>
     </AnimatePresence>
   );

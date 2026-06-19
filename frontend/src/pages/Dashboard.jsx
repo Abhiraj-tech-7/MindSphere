@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Flame, Droplets, Moon, Sparkles, Activity, TrendingUp, CalendarClock, Search,
   Wind, ClipboardList, HeartPulse, Smile, BookHeart,
@@ -11,6 +11,7 @@ import TutorialOverlay from "../components/TutorialOverlay";
 import { http } from "../lib/api";
 import { useAuth } from "../lib/auth.jsx";
 import { toast } from "sonner";
+import useDocTitle from "../hooks/useDocTitle";
 
 const Ring = ({ value, size = 110, stroke = 10, color = "#a78bfa" }) => {
   const r = (size - stroke) / 2;
@@ -51,13 +52,29 @@ const Heatmap = ({ data }) => (
 );
 
 const Dashboard = () => {
-  const { user } = useAuth();
+  useDocTitle("Dashboard");
+  const { user, refresh } = useAuth();
   const [data, setData] = useState(null);
   const [verse, setVerse] = useState(null);
   const [hydrating, setHydrating] = useState(false);
   const [grat, setGrat] = useState("");
   const [showTutorial, setShowTutorial] = useState(false);
   const nav = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Stripe checkout success toast — fires once when returning from successful checkout
+  useEffect(() => {
+    if (searchParams.get("checkout") === "success") {
+      toast.success("🎉 Welcome to MindSphere Pro! Your subscription is active.");
+      // Refresh user to pick up the new plan
+      if (refresh) refresh();
+      // Clean up the URL
+      const next = new URLSearchParams(searchParams);
+      next.delete("checkout"); next.delete("session_id");
+      setSearchParams(next, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const load = async () => {
     try {

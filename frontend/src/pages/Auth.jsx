@@ -16,6 +16,13 @@ const Auth = () => {
   const { login, register } = useAuth();
   const nav = useNavigate();
 
+  React.useEffect(() => {
+    document.title = "Sign in — MindSphere";
+    if (params.get("deleted") === "true") {
+      toast.success("Your MindSphere account has been deleted. We're sorry to see you go.");
+    }
+  }, []);
+
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);

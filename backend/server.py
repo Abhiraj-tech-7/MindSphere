@@ -1,15 +1,18 @@
-"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + Emergent LLM + Gemini Live)."""
+"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + OpenAI + Gemini Live + Stripe)."""
 import os
 import uuid
 import logging
 import asyncio
 import base64
 import json
+import hashlib
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, UploadFile, File, WebSocket, WebSocketDisconnect, Query, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -17,6 +20,9 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import bcrypt
 import jwt
+import openai
+import stripe
+import resend
 
 from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 from google import genai as google_genai
@@ -28,11 +34,45 @@ load_dotenv(ROOT_DIR / ".env")
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-EMERGENT_LLM_KEY = os.environ["EMERGENT_LLM_KEY"]
+EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+
+# OpenAI key rotation pool
+try:
+    OPENAI_KEY_POOL = json.loads(os.environ.get("OPENAI_KEY_POOL", "[]"))
+except Exception:
+    OPENAI_KEY_POOL = []
+if not OPENAI_KEY_POOL and os.environ.get("OPENAI_API_KEY"):
+    OPENAI_KEY_POOL = [os.environ["OPENAI_API_KEY"]]
+_openai_idx = 0
+_openai_key_failures: Dict[int, float] = {}  # index -> failed_at ts
+
+def _next_openai_key() -> Optional[str]:
+    """Return current OpenAI key, skipping ones that failed in last 60s."""
+    global _openai_idx
+    if not OPENAI_KEY_POOL:
+        return None
+    n = len(OPENAI_KEY_POOL)
+    for _ in range(n):
+        idx = _openai_idx % n
+        failed_at = _openai_key_failures.get(idx, 0)
+        if time.time() - failed_at > 60:
+            return OPENAI_KEY_POOL[idx]
+        _openai_idx += 1
+    return None
+
+# Stripe
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_MONTHLY = os.environ.get("STRIPE_PRICE_MONTHLY", "")
+STRIPE_PRICE_ANNUAL = os.environ.get("STRIPE_PRICE_ANNUAL", "")
+
+# Resend
+resend.api_key = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "info@mindsphere.fit")
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -88,7 +128,33 @@ async def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(b
     user = await db.users.find_one({"id": uid}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(401, "User not found")
+    user = await resolve_plan(user)
     return user
+
+
+def check_access(user: Dict[str, Any], feature: str) -> bool:
+    """Return True if user's plan grants access to feature."""
+    plan = user.get("plan", "trial")
+    if plan in ("trial", "pro"):
+        return True
+    # free plan
+    return feature in FREE_FEATURES
+
+
+def require_access(feature: str):
+    """FastAPI dependency factory: enforce check_access or raise 403."""
+    async def _dep(user=Depends(current_user)):
+        if not check_access(user, feature):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "upgrade_required",
+                    "feature": feature,
+                    "message": "Upgrade to MindSphere Pro to access this feature.",
+                },
+            )
+        return user
+    return _dep
 
 
 def strip_id(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -183,19 +249,110 @@ EMOTION_COLOR = {
 }
 
 
-# ---------- LLM ----------
+# ---------- LLM (Official OpenAI SDK with key rotation) ----------
 async def llm_chat(system: str, user_text: str, session_id: str = "default", images: List[str] = None) -> str:
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system).with_model(*LLM_MODEL)
+    """OpenAI chat with 15s timeout, key rotation pool, and graceful fallback."""
+    model = "gpt-4o" if images else "gpt-4o-mini"
+    content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
     if images:
-        chat = chat.with_model(*LLM_VISION_MODEL)
-        msg = UserMessage(text=user_text, file_contents=[ImageContent(image_base64=i) for i in images])
-    else:
-        msg = UserMessage(text=user_text)
+        for img in images:
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
+
+    global _openai_idx
+    n = len(OPENAI_KEY_POOL)
+    if n == 0:
+        log.error("No OpenAI keys configured")
+        return "MindSphere's AI is taking a short break — we'll be back in a few minutes. Your data is safe."
+
+    last_err: Optional[Exception] = None
+    for attempt in range(min(n, 3)):
+        key = _next_openai_key()
+        if not key:
+            break
+        try:
+            cli = openai.AsyncOpenAI(api_key=key)
+            resp = await asyncio.wait_for(
+                cli.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": content},
+                    ],
+                    max_tokens=1500,
+                ),
+                timeout=15.0,
+            )
+            return resp.choices[0].message.content or ""
+        except asyncio.TimeoutError:
+            log.warning("llm_chat timeout session=%s", session_id)
+            return "Lyra is taking a breath — please try again in a moment."
+        except (openai.RateLimitError, openai.AuthenticationError) as e:
+            log.warning("OpenAI key idx=%s failed (%s); rotating", _openai_idx % n, type(e).__name__)
+            _openai_key_failures[_openai_idx % n] = time.time()
+            _openai_idx += 1
+            last_err = e
+            continue
+        except Exception as e:
+            log.exception("llm_chat error session=%s", session_id)
+            return f"Lyra is briefly resting. Please try again. ({str(e)[:80]})"
+
+    log.error("All OpenAI keys exhausted: %s", last_err)
+    # Emergency fallback: use Emergent LLM key via legacy wrapper so the app stays functional
+    if EMERGENT_LLM_KEY:
+        try:
+            log.warning("Falling back to EMERGENT_LLM_KEY (OpenAI quota exhausted)")
+            chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system).with_model(*LLM_MODEL)
+            if images:
+                chat = chat.with_model(*LLM_VISION_MODEL)
+                msg = UserMessage(text=user_text, file_contents=[ImageContent(image_base64=i) for i in images])
+            else:
+                msg = UserMessage(text=user_text)
+            return await asyncio.wait_for(chat.send_message(msg), timeout=15.0)
+        except Exception as e:
+            log.exception("Emergent fallback also failed")
+    return "MindSphere's AI is taking a short break — we'll be back in a few minutes. Your data is safe."
+
+
+# ---------- Plan / Trial logic ----------
+TRIAL_DAYS = 7
+PRO_FEATURES = {"chat", "journal", "voice", "diet", "assessments", "disturbance"}
+FREE_FEATURES = {"mood_log", "sleep_log", "meditation", "community"}
+FREE_JOURNAL_LIFETIME_CAP = 2
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
     try:
-        return await chat.send_message(msg)
-    except Exception as e:
-        log.exception("llm error")
-        return f"(Lyra is briefly resting. {str(e)[:100]})"
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+async def resolve_plan(user: Dict[str, Any]) -> Dict[str, Any]:
+    """Reconcile a user's plan against trial_end + subscription_status. Mutates DB if needed."""
+    plan = user.get("plan")
+    if not plan:
+        # Backfill for legacy users
+        start = datetime.now(timezone.utc)
+        end = start + timedelta(days=TRIAL_DAYS)
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$set": {"plan": "trial", "trial_start": start.isoformat(),
+                      "trial_end": end.isoformat()}},
+        )
+        user["plan"] = "trial"
+        user["trial_start"] = start.isoformat()
+        user["trial_end"] = end.isoformat()
+        return user
+
+    if plan == "trial":
+        end = _parse_iso(user.get("trial_end"))
+        if end and datetime.now(timezone.utc) > end and user.get("subscription_status") != "active":
+            await db.users.update_one({"id": user["id"]}, {"$set": {"plan": "free"}})
+            user["plan"] = "free"
+    return user
+
+
+
 
 
 async def detect_emotion(text: str) -> Dict[str, Any]:
@@ -226,6 +383,8 @@ async def register(req: RegisterReq):
     if existing:
         raise HTTPException(400, "Email already registered")
     uid = new_id()
+    trial_start = datetime.now(timezone.utc)
+    trial_end = trial_start + timedelta(days=TRIAL_DAYS)
     doc = {
         "id": uid,
         "name": req.name,
@@ -235,11 +394,31 @@ async def register(req: RegisterReq):
         "onboarded": False,
         "onboarding": {},
         "tutorial_completed": False,
-        "preferences": {"lyra_name": "Lyra", "voice": "alloy", "style": "warm", "accent": "purple"},
+        "preferences": {"lyra_name": "Lyra", "voice": "alloy", "style": "warm", "accent": "purple", "theme": "midnight"},
+        "notification_prefs": {
+            "daily_journal": True, "journal_time": "20:00",
+            "mood_checkin": False, "mood_time": "19:00",
+            "weekly_digest": False, "appointment_reminders": True,
+            "trial_warnings": True, "promotional": False,
+        },
+        "plan": "trial",
+        "trial_start": trial_start.isoformat(),
+        "trial_end": trial_end.isoformat(),
+        "stripe_customer_id": None,
+        "stripe_subscription_id": None,
+        "subscription_status": None,
+        "billing_cycle": None,
+        "next_billing_date": None,
         "created_at": now_iso(),
     }
     await db.users.insert_one(doc)
     token = make_token(uid)
+    # Fire welcome email (best-effort; never blocks)
+    asyncio.create_task(send_email(
+        to=req.email,
+        subject=f"Welcome to MindSphere, {req.name} 💜",
+        html=_welcome_email_html(req.name),
+    ))
     return {"token": token, "user": {k: v for k, v in doc.items() if k not in ("password", "_id")}}
 
 
@@ -298,7 +477,7 @@ async def update_prefs(prefs: Dict[str, Any], user=Depends(current_user)):
 
 @api.patch("/users/profile")
 async def update_profile(data: Dict[str, Any], user=Depends(current_user)):
-    allowed = {k: v for k, v in data.items() if k in ("name", "avatar", "timezone", "language")}
+    allowed = {k: v for k, v in data.items() if k in ("name", "avatar", "timezone", "language", "notification_prefs")}
     await db.users.update_one({"id": user["id"]}, {"$set": allowed})
     return {"ok": True}
 
@@ -1735,18 +1914,399 @@ async def resources(user=Depends(current_user)):
 
 
 # ============================================================
+# BILLING — Stripe Subscriptions
+# ============================================================
+
+PRICE_MAP = {
+    "monthly": (STRIPE_PRICE_MONTHLY, "monthly"),
+    "annual": (STRIPE_PRICE_ANNUAL, "annual"),
+}
+
+
+def _public_origin(request: Request) -> str:
+    """Resolve the canonical app origin from the request (works behind ingress)."""
+    fwd_proto = request.headers.get("x-forwarded-proto", "https")
+    fwd_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+    if fwd_host:
+        return f"{fwd_proto}://{fwd_host}"
+    return str(request.base_url).rstrip("/")
+
+
+@api.get("/billing/status")
+async def billing_status(user=Depends(current_user)):
+    """Return current plan + trial/subscription metadata."""
+    plan = user.get("plan", "trial")
+    trial_end = _parse_iso(user.get("trial_end"))
+    trial_days_remaining: Optional[int] = None
+    if trial_end:
+        delta = (trial_end - datetime.now(timezone.utc)).total_seconds() / 86400.0
+        trial_days_remaining = max(0, int(delta + 0.5))  # round to whole days
+    return {
+        "plan": plan,
+        "trial_days_remaining": trial_days_remaining if plan == "trial" else None,
+        "trial_end": user.get("trial_end") if plan == "trial" else None,
+        "subscription_status": user.get("subscription_status"),
+        "billing_cycle": user.get("billing_cycle"),
+        "next_billing_date": user.get("next_billing_date"),
+        "active_since": user.get("subscription_active_since"),
+    }
+
+
+@api.post("/billing/create-checkout-session")
+async def create_checkout_session(payload: Dict[str, Any], request: Request, user=Depends(current_user)):
+    """Create a Stripe Checkout Session for monthly or annual Pro subscription."""
+    if not stripe.api_key:
+        raise HTTPException(500, "Stripe not configured")
+    plan = payload.get("plan", "monthly")
+    if plan not in PRICE_MAP:
+        raise HTTPException(400, "Invalid plan")
+    price_id, cycle = PRICE_MAP[plan]
+    if not price_id:
+        raise HTTPException(500, f"Price ID for {plan} not configured")
+
+    # Resolve or create Stripe Customer
+    customer_id = user.get("stripe_customer_id")
+    if not customer_id:
+        try:
+            cust = stripe.Customer.create(
+                email=user["email"],
+                name=user.get("name") or "MindSphere User",
+                metadata={"user_id": user["id"]},
+            )
+            customer_id = cust.id
+            await db.users.update_one({"id": user["id"]}, {"$set": {"stripe_customer_id": customer_id}})
+        except Exception as e:
+            log.exception("stripe customer create failed")
+            raise HTTPException(502, f"Stripe customer error: {str(e)[:120]}")
+
+    origin = _public_origin(request)
+    try:
+        session = stripe.checkout.Session.create(
+            customer=customer_id,
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=f"{origin}/app/dashboard?checkout=success&session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{origin}/pricing",
+            allow_promotion_codes=True,
+            metadata={"user_id": user["id"], "billing_cycle": cycle, "kind": "subscription"},
+            subscription_data={"metadata": {"user_id": user["id"], "billing_cycle": cycle}},
+        )
+        await db.payment_transactions.insert_one({
+            "id": new_id(),
+            "user_id": user["id"],
+            "session_id": session.id,
+            "kind": "subscription",
+            "billing_cycle": cycle,
+            "status": "initiated",
+            "created_at": now_iso(),
+        })
+        return {"url": session.url, "session_id": session.id}
+    except Exception as e:
+        log.exception("stripe checkout create failed")
+        raise HTTPException(502, f"Stripe checkout error: {str(e)[:120]}")
+
+
+@api.post("/billing/create-portal-session")
+async def create_portal_session(request: Request, user=Depends(current_user)):
+    """Create Stripe Customer Portal session for managing subscription."""
+    if not stripe.api_key:
+        raise HTTPException(500, "Stripe not configured")
+    customer_id = user.get("stripe_customer_id")
+    if not customer_id:
+        raise HTTPException(400, "No Stripe customer on file")
+    origin = _public_origin(request)
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=f"{origin}/app/settings?tab=subscription",
+        )
+        return {"url": session.url}
+    except Exception as e:
+        log.exception("stripe portal create failed")
+        raise HTTPException(502, f"Stripe portal error: {str(e)[:120]}")
+
+
+@app.post("/api/billing/webhook")
+async def billing_webhook(request: Request):
+    """UNAUTHENTICATED Stripe webhook receiver. Verifies signature, processes events."""
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    if not STRIPE_WEBHOOK_SECRET:
+        log.error("STRIPE_WEBHOOK_SECRET not configured")
+        return Response(status_code=400)
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        log.warning("webhook signature verification failed: %s", str(e)[:120])
+        return Response(status_code=400)
+
+    etype = event["type"]
+    obj = event["data"]["object"]
+    log.info("stripe webhook: %s", etype)
+
+    try:
+        if etype == "checkout.session.completed":
+            user_id = (obj.get("metadata") or {}).get("user_id")
+            cycle = (obj.get("metadata") or {}).get("billing_cycle") or "monthly"
+            sub_id = obj.get("subscription")
+            cust_id = obj.get("customer")
+            if user_id:
+                update: Dict[str, Any] = {
+                    "plan": "pro",
+                    "stripe_subscription_id": sub_id,
+                    "stripe_customer_id": cust_id,
+                    "subscription_status": "active",
+                    "billing_cycle": cycle,
+                    "subscription_active_since": now_iso(),
+                }
+                # Pull next billing date from subscription
+                if sub_id:
+                    try:
+                        sub = stripe.Subscription.retrieve(sub_id)
+                        if sub.get("current_period_end"):
+                            update["next_billing_date"] = datetime.fromtimestamp(sub["current_period_end"], tz=timezone.utc).isoformat()
+                    except Exception:
+                        pass
+                await db.users.update_one({"id": user_id}, {"$set": update})
+                await db.payment_transactions.update_one(
+                    {"session_id": obj.get("id")},
+                    {"$set": {"status": "completed", "completed_at": now_iso()}},
+                )
+                user = await db.users.find_one({"id": user_id}, {"_id": 0})
+                if user:
+                    asyncio.create_task(send_email(
+                        to=user["email"],
+                        subject="You're now on MindSphere Pro 🎉",
+                        html=_subscription_confirmed_email_html(user.get("name", "there"), cycle),
+                    ))
+
+        elif etype == "customer.subscription.updated":
+            sub_id = obj.get("id")
+            status_ = obj.get("status")
+            cycle = (obj.get("metadata") or {}).get("billing_cycle")
+            next_bd = None
+            if obj.get("current_period_end"):
+                next_bd = datetime.fromtimestamp(obj["current_period_end"], tz=timezone.utc).isoformat()
+            update = {"subscription_status": status_}
+            if cycle:
+                update["billing_cycle"] = cycle
+            if next_bd:
+                update["next_billing_date"] = next_bd
+            await db.users.update_one({"stripe_subscription_id": sub_id}, {"$set": update})
+
+        elif etype == "customer.subscription.deleted":
+            sub_id = obj.get("id")
+            await db.users.update_one(
+                {"stripe_subscription_id": sub_id},
+                {"$set": {"plan": "free", "subscription_status": "canceled",
+                          "stripe_subscription_id": None}},
+            )
+
+        elif etype == "invoice.payment_failed":
+            cust_id = obj.get("customer")
+            await db.users.update_one(
+                {"stripe_customer_id": cust_id},
+                {"$set": {"subscription_status": "past_due"}},
+            )
+            user = await db.users.find_one({"stripe_customer_id": cust_id}, {"_id": 0})
+            if user:
+                await db.notifications.insert_one({
+                    "id": new_id(),
+                    "user_id": user["id"],
+                    "kind": "payment_failed",
+                    "title": "Payment failed",
+                    "body": "Update your payment method to keep your Pro features.",
+                    "created_at": now_iso(),
+                    "read": False,
+                })
+                asyncio.create_task(send_email(
+                    to=user["email"],
+                    subject="Action needed: MindSphere payment failed",
+                    html=_payment_failed_email_html(user.get("name", "there")),
+                ))
+    except Exception as e:
+        log.exception("webhook processing error")
+        # Still return 200 so Stripe doesn't retry endlessly for non-recoverable errors
+        return JSONResponse({"received": True, "warning": str(e)[:120]}, status_code=200)
+
+    return {"received": True}
+
+
+# ============================================================
+# USERS — Export / Delete account
+# ============================================================
+@api.get("/users/export")
+async def export_user_data(user=Depends(current_user)):
+    """Aggregate all user data into a single JSON download."""
+    uid = user["id"]
+    collections = [
+        ("user", db.users, {"id": uid}, {"password": 0}),
+        ("journal", db.journal, {"user_id": uid}, {}),
+        ("mood", db.mood, {"user_id": uid}, {}),
+        ("sleep", db.sleep, {"user_id": uid}, {}),
+        ("assessments", db.assessments, {"user_id": uid}, {}),
+        ("appointments", db.appointments, {"user_id": uid}, {}),
+        ("disturbances", db.disturbance, {"user_id": uid}, {}),
+        ("breathing", db.breathing, {"user_id": uid}, {}),
+        ("gratitude", db.gratitude, {"user_id": uid}, {}),
+        ("hydration", db.hydration, {"user_id": uid}, {}),
+        ("exercise_log", db.exercise_log, {"user_id": uid}, {}),
+        ("diet", db.diet, {"user_id": uid}, {}),
+        ("recipes", db.recipes, {"user_id": uid}, {}),
+        ("chat", db.chat, {"user_id": uid}, {}),
+    ]
+    out: Dict[str, Any] = {"exported_at": now_iso(), "data": {}}
+    for name, coll, q, proj in collections:
+        try:
+            proj_full = {"_id": 0, **proj}
+            if name == "user":
+                doc = await coll.find_one(q, proj_full)
+                out["data"][name] = doc
+            else:
+                items = await coll.find(q, proj_full).to_list(length=10000)
+                out["data"][name] = items
+        except Exception as e:
+            log.warning("export coll %s failed: %s", name, e)
+            out["data"][name] = []
+    body = json.dumps(out, default=str, indent=2)
+    fname = f"mindsphere_data_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.json"
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@api.delete("/users/me")
+async def delete_my_account(user=Depends(current_user)):
+    """Permanently delete a user and all related data. Cancels Stripe subscription if active."""
+    uid = user["id"]
+    if user["email"] == "demo@mindsphere.app":
+        raise HTTPException(400, "The demo account cannot be deleted.")
+    sub_id = user.get("stripe_subscription_id")
+    if sub_id and stripe.api_key:
+        try:
+            stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
+        except Exception as e:
+            log.warning("cancel sub on delete failed: %s", str(e)[:120])
+
+    collections = [
+        db.users, db.journal, db.mood, db.sleep, db.assessments,
+        db.appointments, db.disturbance, db.breathing, db.gratitude,
+        db.hydration, db.exercise_log, db.diet, db.recipes, db.chat,
+        db.community_posts, db.usage, db.streaks, db.notifications,
+        db.payment_transactions,
+    ]
+    for coll in collections:
+        try:
+            await coll.delete_many({"user_id": uid})
+        except Exception:
+            pass
+    await db.users.delete_one({"id": uid})
+    return {"success": True}
+
+
+# ============================================================
+# EMAIL HELPERS (Resend)
+# ============================================================
+async def send_email(to: str, subject: str, html: str) -> None:
+    """Best-effort transactional email. Never raises."""
+    if not resend.api_key:
+        log.warning("Resend not configured; skipping email to %s", to)
+        return
+    try:
+        # resend SDK is synchronous; offload
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: resend.Emails.send({
+                "from": RESEND_FROM_EMAIL,
+                "to": [to],
+                "subject": subject,
+                "html": html,
+            }),
+        )
+    except Exception as e:
+        log.error("Failed to send email to %s: %s", to, str(e)[:200])
+
+
+def _email_shell(content_html: str) -> str:
+    return f"""
+    <div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#0a0a14;color:#e7e7ea;padding:32px 0;">
+      <div style="max-width:560px;margin:0 auto;padding:32px;background:#0f0f1a;border-radius:20px;border:1px solid rgba(255,255,255,0.06);">
+        <div style="font-size:18px;font-weight:600;letter-spacing:0.3px;color:#c084fc;margin-bottom:24px;">MindSphere</div>
+        {content_html}
+        <div style="margin-top:32px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.06);color:#7a7a85;font-size:12px;">
+          MindSphere · Your mind, understood.<br/>
+          Not a substitute for professional mental health care.
+        </div>
+      </div>
+    </div>
+    """
+
+
+def _welcome_email_html(name: str) -> str:
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;">Welcome, {name} 💜</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">You're in. MindSphere is here to help you understand your inner weather — through gentle journaling, mood tracking, and real conversations with Lyra, your AI companion.</p>
+      <p style="line-height:1.6;color:#b8b8c0;"><b>Your 7-day free trial is active.</b> You have full access to everything — journal, voice, meal plans, assessments. No credit card required.</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/app/dashboard" style="display:inline-block;background:#c084fc;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Open your dashboard →</a></p>
+    """)
+
+
+def _subscription_confirmed_email_html(name: str, cycle: str) -> str:
+    cycle_display = "Monthly ($14.99/mo)" if cycle == "monthly" else "Annual ($149.99/yr)"
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;">You're on MindSphere Pro 🎉</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">Hi {name}, your <b>{cycle_display}</b> plan is active. Lyra Voice, AI meal plans, full assessments, and disturbance detection are all unlocked.</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/app/dashboard" style="display:inline-block;background:#c084fc;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Open dashboard →</a></p>
+    """)
+
+
+def _payment_failed_email_html(name: str) -> str:
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;color:#f59e0b;">Action needed: payment failed</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">Hi {name}, we couldn't process your last MindSphere payment. Your Pro features will remain active for 3 more days.</p>
+      <p style="line-height:1.6;color:#b8b8c0;">Update your payment method to avoid any interruption.</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/app/settings?tab=subscription" style="display:inline-block;background:#f59e0b;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Update payment →</a></p>
+    """)
+
+
+# ============================================================
 # Seed demo user
 # ============================================================
 @app.on_event("startup")
 async def seed_demo():
     existing = await db.users.find_one({"email": "demo@mindsphere.app"})
+    trial_start = datetime.now(timezone.utc)
+    trial_end = trial_start + timedelta(days=TRIAL_DAYS)
     if existing:
+        # Ensure demo user always has trial fields current (idempotent)
+        await db.users.update_one(
+            {"id": existing["id"]},
+            {"$set": {
+                "plan": "trial",
+                "trial_start": trial_start.isoformat(),
+                "trial_end": trial_end.isoformat(),
+                "subscription_status": None,
+            }, "$setOnInsert": {}},
+        )
         return
     uid = "demo-user-id-001"
     user = {
         "id": uid, "name": "Aria Demo", "email": "demo@mindsphere.app",
         "password": hash_pw("demo1234"), "avatar": None, "onboarded": True,
         "tutorial_completed": True,
+        "plan": "trial",
+        "trial_start": trial_start.isoformat(),
+        "trial_end": trial_end.isoformat(),
+        "stripe_customer_id": None, "stripe_subscription_id": None,
+        "subscription_status": None, "billing_cycle": None, "next_billing_date": None,
+        "notification_prefs": {
+            "daily_journal": True, "journal_time": "20:00",
+            "mood_checkin": False, "mood_time": "19:00",
+            "weekly_digest": False, "appointment_reminders": True,
+            "trial_warnings": True, "promotional": False,
+        },
         "onboarding": {
             "primary_goal": "Improve mood", "current_state": 6,
             "stressors": ["Work", "Finances"], "sleep_hours": 7, "exercise_freq": "1-2x week",
@@ -1757,7 +2317,7 @@ async def seed_demo():
             "negative_triggers": ["Deadlines", "Conflict", "Noise"],
             "energy_level": 6, "perfect_day": "A morning walk, deep work, dinner with a friend.",
         },
-        "preferences": {"lyra_name": "Lyra", "voice": "alloy", "style": "warm", "accent": "purple"},
+        "preferences": {"lyra_name": "Lyra", "voice": "alloy", "style": "warm", "accent": "purple", "theme": "midnight"},
         "created_at": now_iso(),
     }
     await db.users.insert_one(user)

@@ -24,7 +24,6 @@ import openai
 import stripe
 import resend
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 from google import genai as google_genai
 from google.genai import types as gtypes
 
@@ -319,6 +318,7 @@ async def llm_chat(system: str, user_text: str, session_id: str = "default", ima
     # Emergency fallback: use Emergent LLM key via legacy wrapper so the app stays functional
     if EMERGENT_LLM_KEY:
         try:
+            from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
             log.warning("Falling back to EMERGENT_LLM_KEY (OpenAI quota exhausted)")
             chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system).with_model(*LLM_MODEL)
             if images:

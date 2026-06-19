@@ -7,9 +7,11 @@ import { http } from "../lib/api";
 import { toast } from "sonner";
 
 const TECHNIQUES = [
-  { id: "478", name: "4-7-8", inhale: 4, hold: 7, exhale: 8, color: "#14b8a6" },
-  { id: "box", name: "Box Breathing", inhale: 4, hold: 4, exhale: 4, holdAfter: 4, color: "#a78bfa" },
-  { id: "coh", name: "Coherent (5-5)", inhale: 5, exhale: 5, color: "#ec4899" },
+  { id: "478", name: "4-7-8", inhale: 4, hold: 7, exhale: 8, color: "#3B82F6", rounds: 4, desc: "Calming for sleep and anxiety" },
+  { id: "box", name: "Box Breathing", inhale: 4, hold: 4, exhale: 4, holdAfter: 4, color: "#10B981", rounds: 4, desc: "Focus and steadiness" },
+  { id: "wimhof", name: "Wim Hof", inhale: 3, exhale: 1, color: "#06B6D4", rounds: 3, desc: "30 cycles, then breath hold + 15s recovery", isWimHof: true },
+  { id: "tri", name: "5-5-5 Triangle", inhale: 5, hold: 5, exhale: 5, color: "#8B5CF6", rounds: 5, desc: "Balanced and grounding" },
+  { id: "res", name: "Resonance", inhale: 5.5, exhale: 5.5, color: "#14B8A6", durationSec: 300, desc: "5 minutes of coherent breathing" },
 ];
 
 /* ---------------- Body Scan with per-part protocols ---------------- */
@@ -170,12 +172,60 @@ const Meditation = () => {
   const [tech, setTech] = useState(TECHNIQUES[0]);
   const [running, setRunning] = useState(false);
   const [phase, setPhase] = useState("Inhale");
+  const [phaseSec, setPhaseSec] = useState(0);
+  const [round, setRound] = useState(1);
+  const [wimHold, setWimHold] = useState(false);
+  const [sessionStart, setSessionStart] = useState(null);
+  const [completed, setCompleted] = useState(null);
   const timer = useRef(null);
+  const countdown = useRef(null);
 
   useEffect(() => { (async () => setMeds((await http.get("/meditations")).data))(); }, []);
 
+  const stop = () => {
+    setRunning(false);
+    setWimHold(false);
+    clearTimeout(timer.current);
+    clearInterval(countdown.current);
+    window.speechSynthesis?.cancel();
+  };
+
+  const finishSession = async (showSummary = true) => {
+    const duration = sessionStart ? Math.floor((Date.now() - sessionStart) / 1000) : 0;
+    stop();
+    if (duration < 20) return;
+    try {
+      await http.post("/breathing/log", { technique: tech.id, duration_sec: duration });
+      if (showSummary) setCompleted({ duration, name: tech.name });
+    } catch {}
+  };
+
   useEffect(() => {
     if (!running) return;
+    setSessionStart((s) => s || Date.now());
+
+    // Wim Hof special flow: 30 fast cycles, then breath hold, then 15s recovery
+    if (tech.isWimHof) {
+      let cycle = 0;
+      const doWim = () => {
+        if (cycle >= 30) {
+          // Breath hold phase — wait for user to tap Release
+          setPhase("Hold (tap Release)");
+          setWimHold(true);
+          return;
+        }
+        cycle += 1;
+        setPhase("Inhale");
+        setPhaseSec(tech.inhale);
+        timer.current = setTimeout(() => {
+          setPhase("Exhale"); setPhaseSec(tech.exhale);
+          timer.current = setTimeout(doWim, tech.exhale * 1000);
+        }, tech.inhale * 1000);
+      };
+      doWim();
+      return () => clearTimeout(timer.current);
+    }
+
     const phases = [
       { name: "Inhale", sec: tech.inhale },
       ...(tech.hold ? [{ name: "Hold", sec: tech.hold }] : []),
@@ -183,17 +233,62 @@ const Meditation = () => {
       ...(tech.holdAfter ? [{ name: "Hold", sec: tech.holdAfter }] : []),
     ];
     let i = 0;
+    let cyclesDone = 0;
     const tick = () => {
       setPhase(phases[i].name);
+      setPhaseSec(phases[i].sec);
       const u = new SpeechSynthesisUtterance(phases[i].name);
       u.rate = 0.85; u.pitch = 0.9; window.speechSynthesis?.speak(u);
-      timer.current = setTimeout(() => { i = (i + 1) % phases.length; tick(); }, phases[i].sec * 1000);
+      // Countdown ticks
+      clearInterval(countdown.current);
+      let s = phases[i].sec;
+      countdown.current = setInterval(() => {
+        s -= 1; setPhaseSec(Math.max(0, s));
+        if (s <= 0) clearInterval(countdown.current);
+      }, 1000);
+      timer.current = setTimeout(() => {
+        i = (i + 1) % phases.length;
+        if (i === 0) {
+          cyclesDone += 1;
+          setRound(cyclesDone + 1);
+          // Resonance: stop at duration; others: stop at rounds
+          if (tech.rounds && cyclesDone >= tech.rounds) { finishSession(true); return; }
+        }
+        tick();
+      }, phases[i].sec * 1000);
     };
     tick();
-    return () => clearTimeout(timer.current);
+    // Resonance time-based stop
+    let resTimer;
+    if (tech.durationSec) {
+      resTimer = setTimeout(() => finishSession(true), tech.durationSec * 1000);
+    }
+    return () => { clearTimeout(timer.current); clearInterval(countdown.current); if (resTimer) clearTimeout(resTimer); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, tech]);
 
-  const stop = () => { setRunning(false); clearTimeout(timer.current); window.speechSynthesis?.cancel(); };
+  const releaseWim = () => {
+    setWimHold(false);
+    setPhase("Recovery");
+    setPhaseSec(15);
+    let s = 15;
+    countdown.current = setInterval(() => {
+      s -= 1; setPhaseSec(Math.max(0, s));
+      if (s <= 0) {
+        clearInterval(countdown.current);
+        setRound((r) => r + 1);
+        if (round >= (tech.rounds || 3)) finishSession(true);
+        else { /* loop wim by toggling running */ setRunning(false); setTimeout(() => setRunning(true), 500); }
+      }
+    }, 1000);
+  };
+
+  const start = () => {
+    setRound(1); setSessionStart(Date.now()); setCompleted(null); setRunning(true);
+  };
+
+  // Orb size: based on phase
+  const orbScale = phase === "Inhale" ? 2 : phase === "Exhale" ? 1 : 1.4;
 
   return (
     <AppShell>
@@ -203,30 +298,67 @@ const Meditation = () => {
         <div className="text-xs uppercase tracking-widest text-teal-300 mb-3">breathing</div>
         <div className="flex gap-2 mb-5 flex-wrap">
           {TECHNIQUES.map(t => (
-            <button key={t.id} onClick={() => setTech(t)} className={`px-4 py-2 rounded-full border text-sm transition ${tech.id === t.id ? "border-teal-400/60 bg-teal-500/15" : "border-white/10 hover:bg-white/5"}`}>{t.name}</button>
+            <button key={t.id} onClick={() => !running && setTech(t)} data-testid={`breath-method-${t.id}`}
+              className={`px-4 py-2 rounded-full border text-sm transition ${tech.id === t.id ? "bg-white/10" : "border-white/10 hover:bg-white/5"}`}
+              style={{ borderColor: tech.id === t.id ? t.color : undefined, color: tech.id === t.id ? t.color : undefined }}>
+              {t.name}
+            </button>
           ))}
         </div>
-        <div className="flex flex-col items-center gap-5 py-4">
-          <motion.div
-            animate={{ scale: phase === "Inhale" ? 1.35 : phase === "Exhale" ? 0.7 : 1 }}
-            transition={{ duration: phase === "Inhale" ? tech.inhale : phase === "Exhale" ? tech.exhale : tech.hold || 1, ease: "easeInOut" }}
-            className="w-44 h-44 rounded-full"
-            style={{ background: `radial-gradient(circle, ${tech.color}, transparent 70%)`, boxShadow: `0 0 80px ${tech.color}` }}
-          />
-          <div className="font-display text-3xl">{running ? phase : "Ready"}</div>
+        <div className="text-xs text-white/55 mb-4 italic">{tech.desc}</div>
+        <div className="flex flex-col items-center gap-5 py-6">
+          <div className="relative flex items-center justify-center" style={{ width: 200, height: 200 }}>
+            <div
+              className="breath-orb absolute flex items-center justify-center"
+              style={{
+                width: 80, height: 80,
+                background: `radial-gradient(circle, ${tech.color}, ${tech.color}55 60%, transparent 80%)`,
+                boxShadow: `0 0 40px 10px ${tech.color}40`,
+                transform: `scale(${running ? orbScale : 1})`,
+                transitionDuration: phaseSec ? `${phaseSec}s` : "0.4s",
+              }}
+              data-testid="breath-orb"
+            >
+              {running && <span className="font-display text-2xl text-white">{phaseSec || ""}</span>}
+            </div>
+          </div>
+          <div className="font-display text-2xl text-white">{running ? phase : "Ready"}</div>
+          {running && tech.rounds && <div className="text-xs text-white/50">Round {Math.min(round, tech.rounds)} of {tech.rounds}</div>}
+          {wimHold && (
+            <button onClick={releaseWim} data-testid="wim-release"
+              className="px-6 py-3 rounded-full font-medium text-black hover:scale-[1.03] transition"
+              style={{ background: tech.color }}>
+              Release ↑
+            </button>
+          )}
           {!running ? (
-            <button onClick={() => setRunning(true)} data-testid="breath-start"
+            <button onClick={start} data-testid="breath-start"
               className="px-6 py-3 rounded-full bg-white text-black flex items-center gap-2 hover:scale-[1.03] transition">
               <Play size={14}/> begin {tech.name}
             </button>
-          ) : (
-            <button onClick={stop} data-testid="breath-stop"
+          ) : !wimHold && (
+            <button onClick={() => finishSession(true)} data-testid="breath-stop"
               className="px-6 py-3 rounded-full border border-white/10 flex items-center gap-2 hover:bg-white/5">
-              <Square size={14}/> stop
+              <Square size={14}/> finish
             </button>
           )}
         </div>
       </Card>
+
+      {/* Session complete card */}
+      <AnimatePresence>
+        {completed && (
+          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="mb-5 glass p-5 flex items-center justify-between" data-testid="breath-complete">
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-teal-300">session complete 🧘</div>
+              <div className="font-display text-xl text-white">{completed.name} · {Math.floor(completed.duration / 60)}m {completed.duration % 60}s</div>
+              <div className="text-xs text-white/55 mt-1">Logged to your meditation streak.</div>
+            </div>
+            <button onClick={() => setCompleted(null)} className="px-4 py-2 rounded-full border border-white/10 hover:bg-white/5 text-sm">close</button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <Card accent="#fb7185" className="mb-5">
         <div className="text-xs uppercase tracking-widest text-rose-300 mb-3">body scan</div>

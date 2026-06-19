@@ -64,7 +64,7 @@ const Onboarding = () => {
         await http.post("/users/onboarding", { answers: final });
         await refresh();
         toast.success("All set. Welcome to MindSphere.");
-        nav("/app/dashboard");
+        nav("/welcome");
       } catch (e) { toast.error("Could not save onboarding"); }
       setSaving(false);
     } else {
@@ -170,10 +170,18 @@ const Onboarding = () => {
             className="flex items-center gap-2 px-5 py-3 rounded-full border border-white/10 hover:bg-white/5 disabled:opacity-30">
             <ChevronLeft size={16} /> Back
           </button>
-          <button onClick={next} disabled={!canNext || saving} data-testid="onb-next"
-            className="flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black font-medium hover:scale-[1.03] transition disabled:opacity-40 disabled:hover:scale-100">
-            {isLast ? (saving ? "Saving…" : "Finish") : "Next"} <ChevronRight size={16} />
-          </button>
+          <div className="flex items-center gap-3">
+            {["positive_triggers", "negative_triggers", "perfect_day", "energy_level"].includes(cur.key) && !isLast && (
+              <button onClick={() => setStep(step + 1)} data-testid="onb-skip"
+                className="text-xs text-white/50 hover:text-white/80">
+                Skip for now →
+              </button>
+            )}
+            <button onClick={next} disabled={!canNext || saving} data-testid="onb-next"
+              className="flex items-center gap-2 px-6 py-3 rounded-full bg-white text-black font-medium hover:scale-[1.03] transition disabled:opacity-40 disabled:hover:scale-100">
+              {isLast ? (saving ? "Saving…" : "Finish") : "Next"} <ChevronRight size={16} />
+            </button>
+          </div>
         </div>
       </div>
     </div>

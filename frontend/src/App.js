@@ -30,6 +30,10 @@ import SettingsPage from "./pages/Settings";
 import Pricing from "./pages/Pricing";
 import PrivacyPolicy from "./pages/PrivacyPolicy";
 import Terms from "./pages/Terms";
+import Welcome from "./pages/Welcome";
+import Community from "./pages/Community";
+import ErrorBoundary from "./components/ErrorBoundary";
+import { AIStatusProvider } from "./components/AIStatus";
 
 const ROUTE_TITLES = {
   "/": "MindSphere — Mental Wellness, Reimagined",
@@ -38,6 +42,8 @@ const ROUTE_TITLES = {
   "/pricing": "Pricing — MindSphere",
   "/privacy": "Privacy Policy — MindSphere",
   "/terms": "Terms of Service — MindSphere",
+  "/welcome": "Welcome — MindSphere",
+  "/app/community": "Community — MindSphere",
   "/app/dashboard": "Dashboard — MindSphere",
   "/app/journal": "Journal — MindSphere",
   "/app/mood": "Mood — MindSphere",
@@ -75,10 +81,12 @@ const Protected = ({ children, needOnboarded = true }) => {
 function App() {
   return (
     <div className="App">
+      <ErrorBoundary>
       <AuthProvider>
         <BrowserRouter>
           <UpgradeProvider>
             <MoodWidgetProvider>
+            <AIStatusProvider>
             <ScrollToTop />
             <TitleManager />
             <TrialBanner />
@@ -89,6 +97,7 @@ function App() {
               <Route path="/pricing" element={<Pricing />} />
               <Route path="/privacy" element={<PrivacyPolicy />} />
               <Route path="/terms" element={<Terms />} />
+              <Route path="/welcome" element={<Protected needOnboarded={false}><Welcome /></Protected>} />
               <Route path="/onboarding" element={<Protected needOnboarded={false}><Onboarding /></Protected>} />
               <Route path="/app" element={<Navigate to="/app/dashboard" replace />} />
               <Route path="/app/dashboard" element={<Protected><Dashboard /></Protected>} />
@@ -106,13 +115,16 @@ function App() {
               <Route path="/app/meditation" element={<Protected><Meditation /></Protected>} />
               <Route path="/app/sleep" element={<Protected><Sleep /></Protected>} />
               <Route path="/app/resources" element={<Protected><Resources /></Protected>} />
+              <Route path="/app/community" element={<Protected><Community /></Protected>} />
               <Route path="/app/settings" element={<Protected><SettingsPage /></Protected>} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
+            </AIStatusProvider>
             </MoodWidgetProvider>
           </UpgradeProvider>
         </BrowserRouter>
       </AuthProvider>
+      </ErrorBoundary>
     </div>
   );
 }

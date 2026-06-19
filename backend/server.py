@@ -2667,7 +2667,239 @@ async def analytics_highlights(user=Depends(current_user)):
     }
 
 
+# ============================================================
+# COMMUNITY BOARD, VOICE SUMMARY, WEEKLY REPORT, MOOD FORECAST
+# ============================================================
 
+COMMUNITY_SEEDS = [
+    {"content": "Grateful for the rain today — it slowed everything down.", "type": "gratitude"},
+    {"content": "You don't have to feel ready to start. You just have to start.", "type": "affirmation"},
+    {"content": "Today I noticed I wasn't anxious — and that was the win.", "type": "gratitude"},
+    {"content": "Healing isn't a straight line. Today's setback isn't tomorrow's truth.", "type": "affirmation"},
+    {"content": "Grateful for my partner who made me tea when I couldn't get up.", "type": "gratitude"},
+    {"content": "I am allowed to take up space. I am allowed to rest.", "type": "affirmation"},
+    {"content": "Thankful for an unexpected phone call from an old friend.", "type": "gratitude"},
+]
+
+
+class CommunityShare(BaseModel):
+    content: str
+    type: str = "gratitude"
+
+
+@api.post("/community/share")
+async def community_share(req: CommunityShare, user=Depends(current_user)):
+    text = (req.content or "").strip()
+    if len(text) < 10 or len(text) > 500:
+        raise HTTPException(400, "Share text must be 10–500 characters.")
+    if req.type not in ("gratitude", "affirmation"):
+        raise HTTPException(400, "Type must be 'gratitude' or 'affirmation'.")
+    try:
+        verdict = await llm_chat(
+            "You are a community moderator for a mental wellness app. Reply with EXACTLY one word: YES or NO.",
+            f"Is this content safe and positive for a mental wellness community? Content: {text}",
+            session_id=f"comm-mod-{user['id']}",
+        )
+        if verdict and "NO" in verdict.upper().split() and "YES" not in verdict.upper().split():
+            raise HTTPException(status_code=400, detail={"error": "content_rejected", "message": "This content wasn't suitable for the community board."})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    await db.community_posts.insert_one({
+        "id": new_id(), "content": text, "type": req.type,
+        "created_at": now_iso(), "is_anonymous": True,
+    })
+    return {"success": True}
+
+
+@api.get("/community/feed")
+async def community_feed(page: int = 1, limit: int = 20, user=Depends(current_user)):
+    limit = max(1, min(50, limit))
+    count = await db.community_posts.count_documents({})
+    if count == 0:
+        await db.community_posts.insert_many([{
+            "id": new_id(),
+            "content": s["content"], "type": s["type"],
+            "created_at": (datetime.now(timezone.utc) - timedelta(hours=i * 3)).isoformat(),
+            "is_anonymous": True,
+        } for i, s in enumerate(COMMUNITY_SEEDS)])
+    skip = (page - 1) * limit
+    items = await db.community_posts.find({}, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit + 1).to_list(length=limit + 1)
+    has_more = len(items) > limit
+    return {"posts": items[:limit], "has_more": has_more}
+
+
+class VoiceSummaryReq(BaseModel):
+    transcript: str
+    duration_seconds: int
+
+
+@api.post("/voice/summarize")
+async def voice_summarize(req: VoiceSummaryReq, user=Depends(current_user)):
+    text = (req.transcript or "").strip()
+    if not text or len(text.split()) < 50:
+        return {"themes": [], "actions": ["Try starting a new voice session when you're ready."], "duration_seconds": req.duration_seconds}
+    prompt = (
+        f"Voice therapy session transcript (~{req.duration_seconds}s):\n\n{text[:6000]}\n\n"
+        "Summarise in 2-3 KEY THEMES and 2 concrete SUGGESTED ACTIONS the user can try. "
+        "Return STRICT JSON only: { themes: [string], actions: [string] }"
+    )
+    try:
+        raw = await llm_chat("You are a warm wellness coach producing strict JSON.", prompt, session_id=f"voice-sum-{user['id']}")
+        parsed = _parse_llm_json(raw) or {}
+    except Exception:
+        parsed = {}
+    return {
+        "themes": parsed.get("themes") or ["Your conversation explored what's been on your mind."],
+        "actions": parsed.get("actions") or ["Write a short journal entry while it's fresh.", "Try a 5-minute breathing exercise."],
+        "duration_seconds": req.duration_seconds,
+    }
+
+
+@api.get("/reports/weekly")
+async def weekly_report(user=Depends(current_user)):
+    today = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+    cache_key = f"weekly:{user['id']}:{week_start.isoformat()}"
+    cached = await db.cache.find_one({"cache_key": cache_key})
+    if cached:
+        exp = _parse_iso(cached.get("expires_at"))
+        if exp and datetime.now(timezone.utc) < exp:
+            return cached["response"]
+
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    moods = await db.mood.find({"user_id": user["id"], "created_at": {"$gte": since}}, {"_id": 0}).sort("created_at", 1).to_list(length=1000)
+    sleeps = await db.sleep.find({"user_id": user["id"]}, {"_id": 0}).sort("date", -1).limit(7).to_list(length=7)
+    journals = await db.journal.find({"user_id": user["id"], "created_at": {"$gte": since}}, {"_id": 0}).to_list(length=200)
+    disturbances = await db.disturbance.count_documents({"user_id": user["id"], "created_at": {"$gte": since}})
+
+    by_day: Dict[str, List[int]] = {}
+    for m in moods:
+        try:
+            d = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).date().isoformat()
+            by_day.setdefault(d, []).append(int(m.get("intensity", 5)))
+        except Exception:
+            continue
+    mood_trend = []
+    for i in range(7):
+        d = (today - timedelta(days=6 - i)).isoformat()
+        scores = by_day.get(d, [])
+        mood_trend.append(round(sum(scores) / len(scores), 1) if scores else 0)
+
+    sleep_avg = round(sum(s.get("hours", 0) or 0 for s in sleeps) / len(sleeps), 1) if sleeps else 0
+
+    emo_counts: Dict[str, int] = {}
+    for j in journals:
+        e = j.get("emotion") or "neutral"
+        emo_counts[e] = emo_counts.get(e, 0) + 1
+    top_emotion = max(emo_counts.items(), key=lambda kv: kv[1])[0] if emo_counts else "reflective"
+
+    prompt = (
+        f"User's 7-day data — mood per day: {mood_trend}, avg sleep: {sleep_avg}h, "
+        f"top emotion: {top_emotion}, journals: {len(journals)}, disturbances flagged: {disturbances}.\n\n"
+        "Suggest 3 concrete, compassionate, specific actions for next week. "
+        "Return STRICT JSON: { suggestions: [{ title: string (3-6 words), body: string (1-2 sentences) }] }"
+    )
+    try:
+        raw = await llm_chat("You are a warm wellness reflector.", prompt, session_id=f"wkly-{user['id']}")
+        parsed = _parse_llm_json(raw) or {}
+        suggestions = parsed.get("suggestions") or []
+    except Exception:
+        suggestions = []
+    if len(suggestions) < 3:
+        defaults = [
+            {"title": "Anchor your mornings", "body": "Pick one small ritual — water, a stretch, a deep breath — to start with intention."},
+            {"title": "Name what's heavy", "body": "Try a 3-minute journal entry on what feels heaviest. Naming gently loosens its grip."},
+            {"title": "Move once a day", "body": "Even a 10-minute walk lifts mood and reduces anxiety. No streak pressure — just one a day."},
+        ]
+        suggestions = (suggestions + defaults)[:3]
+
+    payload = {
+        "top_emotion": top_emotion, "mood_trend": mood_trend, "sleep_average": sleep_avg,
+        "journal_count": len(journals), "disturbances_flagged": disturbances,
+        "suggestions": suggestions[:3], "generated_at": now_iso(),
+        "week_start": week_start.isoformat(),
+    }
+    await db.cache.update_one(
+        {"cache_key": cache_key},
+        {"$set": {"cache_key": cache_key, "response": payload,
+                  "generated_at": now_iso(),
+                  "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
+        upsert=True,
+    )
+    return payload
+
+
+@api.get("/analytics/forecast")
+async def mood_forecast(user=Depends(current_user)):
+    since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    moods = await db.mood.find({"user_id": user["id"], "created_at": {"$gte": since}}, {"_id": 0}).to_list(length=2000)
+    sleeps = await db.sleep.find({"user_id": user["id"]}, {"_id": 0}).sort("date", -1).limit(30).to_list(length=30)
+
+    by_day: Dict[str, List[int]] = {}
+    for m in moods:
+        try:
+            d = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).date().isoformat()
+            by_day.setdefault(d, []).append(int(m.get("intensity", 5)))
+        except Exception:
+            continue
+    if len(by_day) < 7:
+        return {"error": "insufficient_data", "message": "Log mood for at least 7 days to enable forecasting."}
+
+    today = datetime.now(timezone.utc).date()
+    cache_key = f"forecast:{user['id']}:{today.isoformat()}"
+    cached = await db.cache.find_one({"cache_key": cache_key})
+    if cached:
+        exp = _parse_iso(cached.get("expires_at"))
+        if exp and datetime.now(timezone.utc) < exp:
+            return cached["response"]
+
+    mood_series = [{"date": d, "score": round(sum(s) / len(s), 1)} for d, s in sorted(by_day.items())]
+    sleep_series = [{"date": s.get("date"), "hours": s.get("hours"), "quality": s.get("quality")} for s in sleeps]
+    prompt = (
+        f"User's 30-day data:\nmoods: {mood_series[-20:]}\nsleep: {sleep_series[:10]}\n"
+        f"Predict mood (1-10) for each of the next 7 days starting {(today + timedelta(days=1)).isoformat()}. "
+        "Mark days with predicted score < 5 as risk:true.\n"
+        "Return STRICT JSON only: {predictions: [{date:string, score:number, confidence:number, risk:boolean}], insight: string}"
+    )
+    try:
+        raw = await llm_chat("You are a wellness forecaster. Return strict JSON.", prompt, session_id=f"fcast-{user['id']}")
+        parsed = _parse_llm_json(raw) or {}
+        preds = parsed.get("predictions") or []
+        insight = parsed.get("insight") or "Your patterns suggest a stable week ahead."
+    except Exception:
+        preds = []
+        insight = "Your patterns suggest a stable week ahead."
+    if not preds:
+        recent = [m["score"] for m in mood_series[-7:]]
+        avg = round(sum(recent) / len(recent), 1) if recent else 6.0
+        preds = [{
+            "date": (today + timedelta(days=i + 1)).isoformat(),
+            "score": avg, "confidence": 0.55, "risk": avg < 5,
+        } for i in range(7)]
+
+    out = {"predictions": preds, "insight": insight}
+    await db.cache.update_one(
+        {"cache_key": cache_key},
+        {"$set": {"cache_key": cache_key, "response": out,
+                  "generated_at": now_iso(),
+                  "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
+        upsert=True,
+    )
+    return out
+
+
+@api.get("/ai/health")
+async def ai_health(user=Depends(current_user)):
+    return {"status": "ok", "openai_keys": len(OPENAI_KEY_POOL), "gemini_keys": 1 if GEMINI_API_KEY else 0}
+
+
+# ============================================================
+# Seed demo user
+# ============================================================
+@app.on_event("startup")
+async def seed_demo():
     existing = await db.users.find_one({"email": "demo@mindsphere.app"})
     trial_start = datetime.now(timezone.utc)
     trial_end = trial_start + timedelta(days=TRIAL_DAYS)
@@ -2749,4 +2981,121 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        if _scheduler:
+            _scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     client.close()
+
+
+# ============================================================
+# Scheduled jobs (APScheduler)
+# ============================================================
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # noqa: E402
+
+_scheduler: Optional["AsyncIOScheduler"] = None
+
+
+def _trial_warn_email_html(name: str) -> str:
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;">Your trial ends in 2 days</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">Hi {name}, your MindSphere Pro trial ends soon. You'll lose access to Lyra, voice mode, AI meal plans, and full assessments.</p>
+      <p style="line-height:1.6;color:#b8b8c0;font-style:italic;">"7 days felt too short. I upgraded on day 3." — Daniel H., 29</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/pricing" style="display:inline-block;background:#c084fc;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Keep my Pro features →</a></p>
+    """)
+
+
+def _trial_expired_email_html(name: str) -> str:
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;">Your MindSphere trial has ended</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">Hi {name}, thanks for trying MindSphere this week. Your data is safe — you can come back anytime.</p>
+      <p style="line-height:1.6;color:#b8b8c0;">Upgrade whenever you're ready and pick up exactly where you left off.</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/pricing" style="display:inline-block;background:#c084fc;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Continue with Pro →</a></p>
+    """)
+
+
+def _weekly_digest_email_html(name: str, top_emotion: str, sleep_avg: float, suggestion: str) -> str:
+    return _email_shell(f"""
+      <h2 style="margin:0 0 12px 0;font-size:24px;">Your week in wellness 💜</h2>
+      <p style="line-height:1.6;color:#b8b8c0;">Hi {name}, here's your week at a glance.</p>
+      <div style="background:rgba(192,132,252,0.08);border:1px solid rgba(192,132,252,0.3);border-radius:16px;padding:16px;margin:16px 0;">
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.2em;color:#c084fc;">top emotion</div>
+        <div style="font-size:22px;color:#fff;text-transform:capitalize;">{top_emotion}</div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.2em;color:#c084fc;margin-top:12px;">avg sleep</div>
+        <div style="font-size:22px;color:#fff;">{sleep_avg}h / night</div>
+      </div>
+      <p style="line-height:1.6;color:#b8b8c0;"><b>For next week:</b> {suggestion}</p>
+      <p style="margin-top:24px;"><a href="https://mindsphere.fit/app/dashboard" style="display:inline-block;background:#c084fc;color:#0a0a14;padding:12px 24px;border-radius:999px;text-decoration:none;font-weight:600;">Open dashboard →</a></p>
+    """)
+
+
+async def _job_trial_warnings():
+    """Find trial users ending in ~2 days and send warning email."""
+    now = datetime.now(timezone.utc)
+    target_low = now + timedelta(days=2)
+    target_high = now + timedelta(days=2, hours=24)
+    users = await db.users.find({
+        "plan": "trial",
+        "trial_end": {"$gte": target_low.isoformat(), "$lt": target_high.isoformat()},
+    }, {"_id": 0, "email": 1, "name": 1, "notification_prefs": 1}).to_list(length=10000)
+    for u in users:
+        prefs = u.get("notification_prefs") or {}
+        if prefs.get("trial_warnings", True) is False:
+            continue
+        await send_email(to=u["email"], subject="Your MindSphere trial ends in 2 days",
+                         html=_trial_warn_email_html(u.get("name") or "there"))
+
+
+async def _job_trial_expired():
+    """Find users whose trial_end was yesterday (and not subscribed) — downgrade + email."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=1)
+    users = await db.users.find({
+        "plan": "trial",
+        "trial_end": {"$lt": now.isoformat(), "$gte": cutoff.isoformat()},
+        "subscription_status": {"$ne": "active"},
+    }, {"_id": 0, "id": 1, "email": 1, "name": 1}).to_list(length=10000)
+    for u in users:
+        await db.users.update_one({"id": u["id"]}, {"$set": {"plan": "free"}})
+        await send_email(to=u["email"], subject="Your MindSphere trial has ended",
+                         html=_trial_expired_email_html(u.get("name") or "there"))
+
+
+async def _job_weekly_digest():
+    """Sunday morning digest for opted-in users."""
+    users = await db.users.find(
+        {"notification_prefs.weekly_digest": True},
+        {"_id": 0, "id": 1, "email": 1, "name": 1},
+    ).to_list(length=10000)
+    for u in users:
+        try:
+            since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            sleeps = await db.sleep.find({"user_id": u["id"]}, {"_id": 0}).sort("date", -1).limit(7).to_list(length=7)
+            sleep_avg = round(sum(s.get("hours", 0) or 0 for s in sleeps) / max(1, len(sleeps)), 1)
+            journals = await db.journal.find({"user_id": u["id"], "created_at": {"$gte": since}}, {"_id": 0}).to_list(length=200)
+            emo_counts: Dict[str, int] = {}
+            for j in journals:
+                e = j.get("emotion") or "neutral"
+                emo_counts[e] = emo_counts.get(e, 0) + 1
+            top = max(emo_counts.items(), key=lambda kv: kv[1])[0] if emo_counts else "reflective"
+            await send_email(
+                to=u["email"],
+                subject=f"Your week in wellness — {datetime.now(timezone.utc).strftime('%b %d')}",
+                html=_weekly_digest_email_html(u.get("name") or "there", top, sleep_avg,
+                                              "Try one small ritual every morning this week to anchor steadier days."),
+            )
+        except Exception as e:
+            log.warning("weekly digest failed for %s: %s", u.get("email"), str(e)[:120])
+
+
+@app.on_event("startup")
+async def _start_scheduler():
+    global _scheduler
+    _scheduler = AsyncIOScheduler(timezone="UTC")
+    _scheduler.add_job(_job_trial_warnings, "cron", hour=0, minute=5, id="trial_warn")
+    _scheduler.add_job(_job_trial_expired, "cron", hour=0, minute=10, id="trial_expired")
+    _scheduler.add_job(_job_weekly_digest, "cron", day_of_week="sun", hour=8, minute=0, id="weekly_digest")
+    _scheduler.start()
+    log.info("APScheduler started: trial_warn, trial_expired, weekly_digest")
+

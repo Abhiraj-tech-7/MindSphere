@@ -1,10 +1,13 @@
 import React, { useEffect, useState } from "react";
 import { motion } from "framer-motion";
-import { Sparkles } from "lucide-react";
+import { Sparkles, TrendingUp, AlertTriangle, Star } from "lucide-react";
+import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceDot } from "recharts";
 import AppShell from "../components/AppShell";
 import { PageHeader, Card } from "../components/Shared";
 import GuidanceCard from "../components/GuidanceCard";
 import { http } from "../lib/api";
+import useDocTitle from "../hooks/useDocTitle";
+import Skeleton from "../components/Skeleton";
 
 const sentimentColor = { happy: "#ec4899", calm: "#14b8a6", grateful: "#a78bfa", sad: "#60a5fa", anxious: "#f59e0b", angry: "#ef4444", reflective: "#c084fc", tired: "#7c8db5" };
 
@@ -44,6 +47,7 @@ const Scatter = ({ data, xKey, yKey, color }) => {
 };
 
 const Analytics = () => {
+  useDocTitle("Analytics");
   const [s, setS] = useState(null);
   const [narrative, setNarrative] = useState("");
   const [loadingN, setLoadingN] = useState(false);
@@ -77,6 +81,12 @@ const Analytics = () => {
         <div className="text-xs uppercase tracking-widest text-pink-300 mb-3">mood heatmap · 12 weeks</div>
         <Heatmap data={s.moods} />
       </Card>
+
+      <YearInPixels />
+
+      <HighlightsCards />
+
+      <MoodForecast />
 
       <div className="mb-5"><GuidanceCard feature="analytics" accent="#a78bfa" title="3 patterns to notice" /></div>
 
@@ -112,3 +122,146 @@ const Analytics = () => {
 };
 
 export default Analytics;
+
+// ============= Year-in-Pixels =============
+const pixelColor = (v) => {
+  if (v === null || v === undefined) return "#1a1a2e";
+  if (v <= 3) return "#3B82F6";
+  if (v <= 6) return "#8B5CF6";
+  if (v <= 8) return "#10B981";
+  return "#34D399";
+};
+
+const YearInPixels = () => {
+  const [days, setDays] = useState(null);
+  useEffect(() => {
+    http.get("/analytics/year-pixels").then(({ data }) => setDays(data.days || [])).catch(() => setDays([]));
+  }, []);
+  return (
+    <Card accent="#a78bfa" className="mb-5">
+      <div className="flex items-center justify-between mb-3">
+        <div className="text-xs uppercase tracking-widest text-purple-300">year in pixels · 365 days</div>
+        <div className="flex gap-1.5 items-center text-[10px] text-white/40">
+          <span>low</span>
+          {["#3B82F6", "#8B5CF6", "#10B981", "#34D399"].map((c) => <span key={c} className="w-3 h-3 rounded-sm" style={{ background: c }} />)}
+          <span>high</span>
+        </div>
+      </div>
+      {!days ? (
+        <Skeleton h={104} />
+      ) : (
+        <div className="grid grid-flow-col grid-rows-7 gap-[3px] overflow-x-auto pb-1" style={{ gridAutoColumns: "12px" }} data-testid="year-pixels">
+          {days.map((d) => (
+            <div
+              key={d.date}
+              title={`${d.date} — ${d.mood_avg !== null ? `${d.mood_avg}/10` : "No data"}`}
+              style={{ width: 12, height: 12, borderRadius: 2, background: pixelColor(d.mood_avg) }}
+            />
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+};
+
+// ============= Best / Toughest Day =============
+const HighlightsCards = () => {
+  const [h, setH] = useState(null);
+  useEffect(() => {
+    http.get("/analytics/highlights").then(({ data }) => setH(data)).catch(() => setH({}));
+  }, []);
+  if (!h) {
+    return (
+      <div className="grid sm:grid-cols-2 gap-4 mb-5">
+        <Card><Skeleton h={70} /></Card><Card><Skeleton h={70} /></Card>
+      </div>
+    );
+  }
+  return (
+    <div className="grid sm:grid-cols-2 gap-4 mb-5">
+      <Card accent="#10b981" data-testid="highlight-best">
+        <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-emerald-300 mb-2">
+          <Star size={12} /> best day this month
+        </div>
+        {h.best ? (
+          <>
+            <div className="font-display text-xl text-white mb-1">{h.best.date}</div>
+            <div className="text-xs text-emerald-300 mb-2">mood {h.best.score}/10</div>
+            <p className="text-sm text-white/75 italic">{h.best.reason}</p>
+          </>
+        ) : <div className="text-sm text-white/40">Log some moods to see your best day.</div>}
+      </Card>
+      <Card accent="#60a5fa" data-testid="highlight-toughest">
+        <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-blue-300 mb-2">
+          💙 toughest day this month
+        </div>
+        {h.toughest ? (
+          <>
+            <div className="font-display text-xl text-white mb-1">{h.toughest.date}</div>
+            <div className="text-xs text-blue-300 mb-2">mood {h.toughest.score}/10</div>
+            <p className="text-sm text-white/75 italic">{h.toughest.reason}</p>
+          </>
+        ) : <div className="text-sm text-white/40">No tough days logged yet.</div>}
+      </Card>
+    </div>
+  );
+};
+
+// ============= Mood Forecast =============
+const MoodForecast = () => {
+  const [f, setF] = useState(null);
+  useEffect(() => {
+    http.get("/analytics/forecast").then(({ data }) => setF(data)).catch(() => setF({ error: "insufficient_data" }));
+  }, []);
+  if (!f) {
+    return <Card className="mb-5"><Skeleton h={200} /></Card>;
+  }
+  if (f.error) {
+    return (
+      <Card accent="#f59e0b" className="mb-5">
+        <div className="text-xs uppercase tracking-widest text-amber-300 mb-2">mood forecast · 7 days</div>
+        <div className="text-sm text-white/65">{f.message || "Log mood for at least 7 days to enable forecasting."}</div>
+      </Card>
+    );
+  }
+  const chartData = f.predictions.map((p) => ({
+    date: p.date.slice(5), score: p.score, low: Math.max(1, p.score - p.confidence * 2),
+    high: Math.min(10, p.score + p.confidence * 2), risk: p.risk,
+  }));
+  const riskDays = chartData.filter((d) => d.risk);
+  return (
+    <Card accent="#a78bfa" className="mb-5" data-testid="mood-forecast">
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-purple-300">
+          <TrendingUp size={12} /> mood forecast · next 7 days
+        </div>
+        {riskDays.length > 0 && (
+          <div className="flex items-center gap-1 text-[11px] text-amber-300">
+            <AlertTriangle size={11} /> {riskDays.length} risk day{riskDays.length === 1 ? "" : "s"}
+          </div>
+        )}
+      </div>
+      <div style={{ width: "100%", height: 220 }}>
+        <ResponsiveContainer>
+          <AreaChart data={chartData}>
+            <defs>
+              <linearGradient id="fcastFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#a78bfa" stopOpacity={0.4} />
+                <stop offset="100%" stopColor="#a78bfa" stopOpacity={0.05} />
+              </linearGradient>
+            </defs>
+            <XAxis dataKey="date" tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} />
+            <YAxis domain={[1, 10]} tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} />
+            <Tooltip contentStyle={{ background: "#0b0b15", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 12, fontSize: 12 }} />
+            <Area type="monotone" dataKey="high" stroke="none" fill="url(#fcastFill)" />
+            <Area type="monotone" dataKey="low" stroke="none" fill="#0b0b15" />
+            <Area type="monotone" dataKey="score" stroke="#c084fc" strokeWidth={2} fill="transparent" />
+            {chartData.map((d, i) => d.risk && <ReferenceDot key={i} x={d.date} y={d.score} r={5} fill="#f59e0b" stroke="#0b0b15" />)}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      <p className="text-xs text-white/55 italic mt-2">{f.insight}</p>
+      <p className="text-[10px] text-white/30 mt-1">Based on your patterns from the past 30 days.</p>
+    </Card>
+  );
+};

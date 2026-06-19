@@ -195,3 +195,25 @@ input, textarea, select {
 
 /* link */
 a { color: inherit; text-decoration: none; }
+
+
+/* shimmer skeleton */
+.ms-skel {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.05);
+}
+.ms-skel::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  animation: ms-shimmer 1.6s linear infinite;
+  transform: translateX(-100%);
+}
+@keyframes ms-shimmer { 100% { transform: translateX(100%); } }
+
+/* breathing orb */
+.breath-orb {
+  border-radius: 50%;
+  transition: transform 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}

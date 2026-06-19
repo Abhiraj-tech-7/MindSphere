@@ -2,10 +2,11 @@ import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
 import {
   Home, BookOpen, Smile, Brain, Mic, Salad, Activity, ClipboardList,
-  Calendar, BarChart3, Search, Wind, Moon, Library, Settings, LogOut, HeartPulse
+  Calendar, BarChart3, Search, Wind, Moon, Library, Settings, LogOut, HeartPulse, Globe
 } from "lucide-react";
 import { useAuth } from "../lib/auth.jsx";
 import { motion } from "framer-motion";
+import { AIStatusDot } from "./AIStatus";
 
 const items = [
   { to: "/app/dashboard", icon: Home, label: "Dashboard", accent: "#a78bfa" },
@@ -23,6 +24,7 @@ const items = [
   { to: "/app/meditation", icon: Wind, label: "Meditation & Breathing", accent: "#14b8a6" },
   { to: "/app/sleep", icon: Moon, label: "Sleep Tracker", accent: "#60a5fa" },
   { to: "/app/resources", icon: Library, label: "Resource Library", accent: "#f59e0b" },
+  { to: "/app/community", icon: Globe, label: "Community", accent: "#10b981" },
   { to: "/app/settings", icon: Settings, label: "Settings", accent: "#9ca3af" },
 ];
 
@@ -73,13 +75,17 @@ export const Sidebar = () => {
           {(user?.name || "U").slice(0, 1)}
         </div>
         <div className="flex-1 min-w-0">
-          <div className="text-sm text-white truncate">{user?.name}</div>
+          <div className="text-sm text-white truncate flex items-center gap-1.5">{user?.name} <AIStatusDot /></div>
           <div className="text-[11px] text-white/40 truncate">{user?.email}</div>
         </div>
         <button onClick={logout} title="Sign out" data-testid="sidebar-logout"
           className="p-2 rounded-lg hover:bg-white/5 text-white/60 hover:text-white transition">
           <LogOut size={15} />
         </button>
+      </div>
+      <div className="px-4 pb-3 text-[10px] text-white/30 text-center space-x-1.5">
+        <a href="/privacy" className="hover:text-white/60">Privacy</a><span>·</span>
+        <a href="/terms" className="hover:text-white/60">Terms</a>
       </div>
     </aside>
   );

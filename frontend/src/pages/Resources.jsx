@@ -35,7 +35,10 @@ const Resources = () => {
             </a>
           ))}
         </div>
-        <div className="text-[11px] text-white/40 mt-3">You matter. Reaching out is brave.</div>
+        <div className="text-[11px] text-white/40 mt-3">
+          If you're in crisis or need immediate support: <span className="text-red-300">Canada 1-833-456-4566</span> · <span className="text-red-300">USA 988</span> · <a className="underline hover:text-white" href="https://findahelpline.com" target="_blank" rel="noreferrer">findahelpline.com</a>
+        </div>
+        <div className="text-[11px] text-white/30 mt-1">You matter. Reaching out is brave.</div>
       </Card>
 
       <div className="flex gap-2 flex-wrap mb-4">

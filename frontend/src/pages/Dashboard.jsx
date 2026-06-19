@@ -12,6 +12,7 @@ import { http } from "../lib/api";
 import { useAuth } from "../lib/auth.jsx";
 import { toast } from "sonner";
 import useDocTitle from "../hooks/useDocTitle";
+import { WellnessRing, StreakRow, MilestoneModal } from "../components/Wellness";
 
 const Ring = ({ value, size = 110, stroke = 10, color = "#a78bfa" }) => {
   const r = (size - stroke) / 2;
@@ -59,6 +60,7 @@ const Dashboard = () => {
   const [hydrating, setHydrating] = useState(false);
   const [grat, setGrat] = useState("");
   const [showTutorial, setShowTutorial] = useState(false);
+  const [milestone, setMilestone] = useState(null);
   const nav = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -124,6 +126,18 @@ const Dashboard = () => {
         title={`${greet}, ${data.name}.`}
         subtitle={data.affirmation}
       />
+
+      {/* Wellness Score + Streaks */}
+      <div className="grid grid-cols-12 gap-4 mb-4">
+        <div className="col-span-12 lg:col-span-8">
+          <WellnessRing />
+        </div>
+        <div className="col-span-12 lg:col-span-4">
+          <StreakRow onMilestone={setMilestone} />
+        </div>
+      </div>
+
+      <MilestoneModal milestone={milestone} onClose={() => setMilestone(null)} />
 
       <div className="grid grid-cols-12 gap-4">
         {/* Mood orb widget */}

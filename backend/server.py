@@ -487,6 +487,18 @@ async def update_profile(data: Dict[str, Any], user=Depends(current_user)):
 # ============================================================
 @api.post("/journal")
 async def create_journal(req: JournalCreate, user=Depends(current_user)):
+    # Plan gating: free plan = 2 lifetime entries max; trial/pro = pass-through
+    if user.get("plan") == "free":
+        count = await db.journal.count_documents({"user_id": user["id"]})
+        if count >= FREE_JOURNAL_LIFETIME_CAP:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "upgrade_required",
+                    "feature": "journal",
+                    "message": "Free plan is limited to 2 journal entries. Upgrade to MindSphere Pro for unlimited journaling.",
+                },
+            )
     emo = await detect_emotion(req.content)
     entry = {
         "id": new_id(),
@@ -501,6 +513,7 @@ async def create_journal(req: JournalCreate, user=Depends(current_user)):
         "created_at": now_iso(),
     }
     await db.journal.insert_one(entry)
+    await increment_streak(user["id"], "journal")
     # also log as mood
     await db.mood.insert_one({
         "id": new_id(), "user_id": user["id"], "emotion": emo["emotion"],
@@ -539,6 +552,7 @@ async def log_mood(req: MoodCreate, user=Depends(current_user)):
         "created_at": now_iso(),
     }
     await db.mood.insert_one(doc)
+    await increment_streak(user["id"], "mood")
     doc.pop("_id", None)
     return doc
 
@@ -573,7 +587,7 @@ async def build_lyra_system(user) -> str:
 
 
 @api.post("/chat")
-async def chat(req: ChatMsgReq, user=Depends(current_user)):
+async def chat(req: ChatMsgReq, user=Depends(require_access("chat"))):
     session_id = req.session_id or f"lyra-{user['id']}"
     system = await build_lyra_system(user)
     reply = await llm_chat(system, req.message, session_id=session_id)
@@ -602,7 +616,7 @@ async def chat_history(user=Depends(current_user), session_id: Optional[str] = N
 # DIET
 # ============================================================
 @api.get("/diet/plan")
-async def get_diet(user=Depends(current_user)):
+async def get_diet(user=Depends(require_access("diet"))):
     existing = await db.diet.find_one({"user_id": user["id"]}, {"_id": 0})
     if existing:
         return existing
@@ -610,7 +624,7 @@ async def get_diet(user=Depends(current_user)):
 
 
 @api.post("/diet/regenerate")
-async def regen_diet(payload: Dict[str, Any], user=Depends(current_user)):
+async def regen_diet(payload: Dict[str, Any], user=Depends(require_access("diet"))):
     reason = payload.get("reason", "Please regenerate the whole plan.")
     day = payload.get("day")
     meal = payload.get("meal")
@@ -684,6 +698,9 @@ async def log_hydration(payload: Dict[str, Any], user=Depends(current_user)):
         upsert=True,
     )
     doc = await db.hydration.find_one({"user_id": user["id"], "date": today}, {"_id": 0})
+    # 8+ glasses = streak day for hydration habit
+    if doc and doc.get("glasses", 0) >= 8:
+        await increment_streak(user["id"], "hydration")
     return doc
 
 
@@ -791,7 +808,7 @@ def _fallback_recipe(meal_name: str, ingredients: List[str], benefit: str,
 
 
 @api.post("/diet/recipe/detail")
-async def recipe_detail(payload: RecipeRequest, user=Depends(current_user)):
+async def recipe_detail(payload: RecipeRequest, user=Depends(require_access("diet"))):
     """Return a full cook-along recipe for an AI-suggested meal."""
     # Cache: keyed by user + meal name
     cached = await db.recipes.find_one(
@@ -812,7 +829,7 @@ async def recipe_detail(payload: RecipeRequest, user=Depends(current_user)):
 
 
 @api.post("/diet/recipe/custom")
-async def recipe_custom(payload: CustomRecipeRequest, user=Depends(current_user)):
+async def recipe_custom(payload: CustomRecipeRequest, user=Depends(require_access("diet"))):
     """Build a custom recipe from the user's answers and save it to their cookbook."""
     onb = user.get("onboarding", {})
     diet_type = onb.get("diet_type", "")
@@ -1044,7 +1061,7 @@ async def assessment_defs(user=Depends(current_user)):
 
 
 @api.post("/assessments")
-async def submit_assessment(req: AssessmentSubmit, user=Depends(current_user)):
+async def submit_assessment(req: AssessmentSubmit, user=Depends(require_access("assessments"))):
     if req.type not in ASSESSMENT_DEFS:
         raise HTTPException(400, "Unknown assessment")
     score = sum(req.answers)
@@ -1196,7 +1213,7 @@ async def analytics_narrative(user=Depends(current_user)):
 
 
 @api.get("/disturbance/scan")
-async def disturbance_scan(user=Depends(current_user)):
+async def disturbance_scan(user=Depends(require_access("disturbance"))):
     journals = await db.journal.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(120).to_list(120)
     moods = await db.mood.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(120).to_list(120)
     from collections import Counter
@@ -1217,7 +1234,7 @@ async def disturbance_scan(user=Depends(current_user)):
 
 
 @api.post("/disturbance/vision")
-async def disturbance_vision(req: VisionAnalyzeReq, user=Depends(current_user)):
+async def disturbance_vision(req: VisionAnalyzeReq, user=Depends(require_access("disturbance"))):
     b64 = req.image_base64
     if "," in b64 and b64.startswith("data:"):
         b64 = b64.split(",", 1)[1]
@@ -1334,8 +1351,9 @@ async def gratitude(req: GratitudeReq, user=Depends(current_user)):
 @api.post("/breathing/log")
 async def breathing_log(req: BreathingLog, user=Depends(current_user)):
     doc = {"id": new_id(), "user_id": user["id"], "technique": req.technique,
-           "duration_sec": req.duration_sec, "created_at": now_iso()}
+           "duration_sec": req.duration_sec, "created_at": now_iso(), "completed_at": now_iso()}
     await db.breathing.insert_one(doc)
+    await increment_streak(user["id"], "meditation")
     doc.pop("_id", None)
     return doc
 
@@ -2272,10 +2290,384 @@ def _payment_failed_email_html(name: str) -> str:
 
 
 # ============================================================
-# Seed demo user
+# WELLNESS SCORE, STREAKS, GRATITUDE, ANALYTICS UPGRADES
 # ============================================================
-@app.on_event("startup")
-async def seed_demo():
+
+HABITS = ["journal", "mood", "meditation", "hydration", "gratitude"]
+
+
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _ensure_streak(user_id: str, habit: str) -> Dict[str, Any]:
+    doc = await db.streaks.find_one({"user_id": user_id, "habit": habit}, {"_id": 0})
+    if doc:
+        return doc
+    doc = {"user_id": user_id, "habit": habit, "current_streak": 0,
+           "longest_streak": 0, "last_logged_date": None}
+    await db.streaks.insert_one(dict(doc))
+    return doc
+
+
+async def increment_streak(user_id: str, habit: str) -> Dict[str, Any]:
+    """Increment a habit's streak when the user does the habit today.
+    Idempotent: calling multiple times in the same day is a no-op."""
+    today = _today_str()
+    cur = await _ensure_streak(user_id, habit)
+    if cur.get("last_logged_date") == today:
+        return cur
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    if cur.get("last_logged_date") == yesterday:
+        new_streak = cur["current_streak"] + 1
+    else:
+        new_streak = 1
+    longest = max(cur.get("longest_streak", 0), new_streak)
+    update = {"current_streak": new_streak, "longest_streak": longest, "last_logged_date": today}
+    await db.streaks.update_one({"user_id": user_id, "habit": habit}, {"$set": update}, upsert=True)
+    return {**cur, **update}
+
+
+@api.get("/streaks")
+async def get_streaks(user=Depends(current_user)):
+    out = []
+    for h in HABITS:
+        out.append(await _ensure_streak(user["id"], h))
+    return {"streaks": out}
+
+
+@api.post("/streaks/check")
+async def check_streaks(user=Depends(current_user)):
+    """Called on app load — reconciles streak rollover and surfaces milestones."""
+    today = datetime.now(timezone.utc).date()
+    milestones = []
+    out = []
+    for h in HABITS:
+        s = await _ensure_streak(user["id"], h)
+        last = s.get("last_logged_date")
+        if last:
+            try:
+                last_d = datetime.strptime(last, "%Y-%m-%d").date()
+                gap = (today - last_d).days
+                if gap >= 2 and s.get("current_streak", 0) > 0:
+                    await db.streaks.update_one(
+                        {"user_id": user["id"], "habit": h},
+                        {"$set": {"current_streak": 0}},
+                    )
+                    s["current_streak"] = 0
+            except Exception:
+                pass
+        # Detect just-hit milestones
+        cs = s.get("current_streak", 0)
+        if cs in (7, 30, 60, 100):
+            # Have we already celebrated this milestone? Track in a separate field
+            celebrated = (s.get("celebrated_milestones") or [])
+            if cs not in celebrated:
+                celebrated = list(celebrated) + [cs]
+                await db.streaks.update_one(
+                    {"user_id": user["id"], "habit": h},
+                    {"$set": {"celebrated_milestones": celebrated}},
+                )
+                milestones.append({"habit": h, "milestone": cs})
+        out.append(s)
+    return {"streaks": out, "milestones": milestones}
+
+
+# --- Wellness Score ---
+@api.get("/wellness/score")
+async def wellness_score(user=Depends(current_user)):
+    today = _today_str()
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    async def _score_for(date_str: str) -> Dict[str, Any]:
+        start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end = start + timedelta(days=1)
+        mood_docs = await db.mood.find({
+            "user_id": user["id"],
+            "created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        }).to_list(length=100)
+        avg_mood = (sum(m.get("intensity", 5) for m in mood_docs) / len(mood_docs)) if mood_docs else 0
+        mood_pts = (avg_mood / 10.0) * 30.0 if mood_docs else 0
+
+        sleep_doc = await db.sleep.find_one({
+            "user_id": user["id"], "date": date_str,
+        })
+        sq = (sleep_doc or {}).get("quality", 0) or 0
+        sleep_pts = (sq / 5.0) * 25.0 if sq else 0
+
+        j_count = await db.journal.count_documents({
+            "user_id": user["id"],
+            "created_at": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        })
+        journal_pts = 20 if j_count >= 1 else 0
+
+        breath_count = await db.breathing.count_documents({
+            "user_id": user["id"],
+            "completed_at": {"$gte": start.isoformat(), "$lt": end.isoformat()},
+        })
+        breathing_pts = 15 if breath_count >= 1 else 0
+
+        hyd = await db.hydration.find_one({"user_id": user["id"], "date": date_str})
+        glasses = (hyd or {}).get("glasses", 0) or 0
+        hyd_pts = min(10.0, (glasses / 8.0) * 10.0)
+
+        total = int(round(mood_pts + sleep_pts + journal_pts + breathing_pts + hyd_pts))
+        return {
+            "score": min(100, total),
+            "breakdown": {
+                "mood": int(round(mood_pts)),
+                "sleep": int(round(sleep_pts)),
+                "journal": journal_pts,
+                "breathing": breathing_pts,
+                "hydration": int(round(hyd_pts)),
+            },
+        }
+
+    today_s = await _score_for(today)
+    yest_s = await _score_for(yesterday)
+    score = today_s["score"]
+    diff = score - yest_s["score"]
+    trend = "up" if diff >= 5 else ("down" if diff <= -5 else "flat")
+
+    # AI insight cache (6h)
+    cache_key = f"insight:{user['id']}:{today}:{score}"
+    cached = await db.cache.find_one({"cache_key": cache_key})
+    if cached and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
+        insight = cached["response"]
+    else:
+        prompt = (
+            f"Today's wellness breakdown — mood:{today_s['breakdown']['mood']}/30, "
+            f"sleep:{today_s['breakdown']['sleep']}/25, journal:{today_s['breakdown']['journal']}/20, "
+            f"breathing:{today_s['breakdown']['breathing']}/15, hydration:{today_s['breakdown']['hydration']}/10. "
+            f"Trend vs yesterday: {trend} ({diff:+d}). Write ONE warm, specific sentence — like a calm friend "
+            f"noticing a pattern — about what stood out today and what to lean into tomorrow. Max 25 words."
+        )
+        try:
+            insight = (await llm_chat("You are a warm wellness coach. One sentence only.", prompt, session_id=f"insight-{user['id']}")).strip()
+        except Exception:
+            insight = "Each small win counts — keep going."
+        await db.cache.update_one(
+            {"cache_key": cache_key},
+            {"$set": {
+                "cache_key": cache_key, "response": insight,
+                "generated_at": now_iso(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+            }},
+            upsert=True,
+        )
+
+    return {
+        "score": score,
+        "yesterday_score": yest_s["score"],
+        "trend": trend,
+        "insight": insight,
+        "breakdown": today_s["breakdown"],
+    }
+
+
+# --- Gratitude ---
+class GratitudeCreate(BaseModel):
+    items: List[str]
+
+
+@api.post("/gratitude")
+async def gratitude_create(req: GratitudeCreate, user=Depends(current_user)):
+    items = [s.strip() for s in (req.items or []) if s and s.strip()]
+    if len(items) != 3:
+        raise HTTPException(400, "Please share exactly 3 gratitudes.")
+    if any(len(s) > 500 for s in items):
+        raise HTTPException(400, "Each gratitude must be 500 characters or fewer.")
+    doc = {
+        "id": new_id(),
+        "user_id": user["id"],
+        "items": items,
+        "date": _today_str(),
+        "created_at": now_iso(),
+    }
+    await db.gratitude.insert_one(dict(doc))
+    streak = await increment_streak(user["id"], "gratitude")
+    doc.pop("_id", None)
+    return {"success": True, "entry": doc, "streak": streak.get("current_streak", 1)}
+
+
+@api.get("/gratitude")
+async def gratitude_list(user=Depends(current_user)):
+    items = await db.gratitude.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).to_list(length=200)
+    return {"items": items}
+
+
+@api.get("/gratitude/weekly-reflection")
+async def gratitude_weekly_reflection(user=Depends(current_user)):
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    recent = await db.gratitude.find(
+        {"user_id": user["id"], "created_at": {"$gte": since}}, {"_id": 0}
+    ).sort("created_at", -1).to_list(length=20)
+    if len(recent) < 3:
+        return {"error": "insufficient_data",
+                "message": "Log gratitude for a few more days to unlock your weekly reflection."}
+    cache_key = f"grat-week:{user['id']}:{_today_str()}"
+    cached = await db.cache.find_one({"cache_key": cache_key})
+    if cached and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
+        return {"reflection": cached["response"]}
+    flat = []
+    for entry in recent:
+        flat.extend(entry.get("items", []))
+    prompt = (
+        "Recent gratitudes from this user (past 7 days):\n- "
+        + "\n- ".join(flat[:25])
+        + "\n\nWrite a warm, specific 2–3 sentence reflection highlighting recurring themes "
+          "and gently encouraging the user. Avoid generic platitudes."
+    )
+    try:
+        reflection = (await llm_chat("You are a warm wellness reflector.", prompt, session_id=f"grat-{user['id']}")).strip()
+    except Exception:
+        reflection = "Your week is full of small, real beauty. Keep collecting these moments."
+    await db.cache.update_one(
+        {"cache_key": cache_key},
+        {"$set": {"cache_key": cache_key, "response": reflection,
+                  "generated_at": now_iso(),
+                  "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
+        upsert=True,
+    )
+    return {"reflection": reflection}
+
+
+# --- Shopping list ---
+PRODUCE = {"spinach", "kale", "lettuce", "tomato", "tomatoes", "onion", "onions", "garlic",
+           "carrot", "carrots", "broccoli", "cucumber", "lemon", "lime", "pepper", "peppers",
+           "bell pepper", "celery", "potato", "potatoes", "sweet potato", "apple", "apples",
+           "banana", "bananas", "berries", "blueberries", "strawberries", "avocado", "mushroom",
+           "mushrooms", "zucchini", "cauliflower", "parsley", "basil", "cilantro", "mint",
+           "ginger", "scallion", "scallions", "leek", "leeks"}
+PROTEIN = {"chicken", "beef", "pork", "fish", "salmon", "tuna", "shrimp", "tofu", "tempeh",
+           "lentils", "chickpeas", "black beans", "kidney beans", "eggs", "turkey", "lamb",
+           "edamame", "seitan"}
+DAIRY = {"milk", "cheese", "yogurt", "yoghurt", "greek yogurt", "butter", "oat milk",
+         "almond milk", "soy milk", "cream", "feta", "mozzarella", "parmesan", "ricotta"}
+GRAINS = {"rice", "brown rice", "pasta", "spaghetti", "bread", "oats", "quinoa", "barley",
+          "couscous", "tortilla", "tortillas", "noodles", "bagel", "pita", "naan", "cereal"}
+BEVERAGES = {"water", "juice", "tea", "coffee", "kombucha", "matcha"}
+
+
+def _classify_ingredient(name: str) -> str:
+    n = name.lower().strip()
+    for word in n.split():
+        if word in PRODUCE: return "Produce"
+        if word in PROTEIN: return "Proteins"
+        if word in DAIRY: return "Dairy & Alternatives"
+        if word in GRAINS: return "Grains & Carbs"
+        if word in BEVERAGES: return "Beverages"
+    for w in PRODUCE:
+        if w in n: return "Produce"
+    for w in PROTEIN:
+        if w in n: return "Proteins"
+    for w in DAIRY:
+        if w in n: return "Dairy & Alternatives"
+    for w in GRAINS:
+        if w in n: return "Grains & Carbs"
+    for w in BEVERAGES:
+        if w in n: return "Beverages"
+    return "Pantry"
+
+
+@api.get("/diet/shopping-list")
+async def shopping_list(user=Depends(current_user)):
+    plan = await db.diet.find_one({"user_id": user["id"]}, {"_id": 0})
+    if not plan:
+        return {"categories": {}}
+    counts: Dict[str, int] = {}
+    for day in plan.get("days", []):
+        for meal in day.get("meals", []):
+            for ing in meal.get("ingredients", []) or []:
+                key = ing.strip().lower() if isinstance(ing, str) else (ing.get("item") if isinstance(ing, dict) else "")
+                if not key: continue
+                counts[key] = counts.get(key, 0) + 1
+    cats: Dict[str, List[Dict[str, Any]]] = {}
+    for name, qty in counts.items():
+        c = _classify_ingredient(name)
+        cats.setdefault(c, []).append({"name": name, "quantity": qty, "unit": "" if qty == 1 else "×"})
+    # Sort each category
+    for c in cats:
+        cats[c].sort(key=lambda x: x["name"])
+    return {"categories": cats}
+
+
+# --- Analytics: Year in Pixels & Highlights ---
+@api.get("/analytics/year-pixels")
+async def year_pixels(user=Depends(current_user)):
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=364)
+    docs = await db.mood.find(
+        {"user_id": user["id"], "created_at": {"$gte": (start - timedelta(days=1)).isoformat()}},
+        {"_id": 0, "intensity": 1, "created_at": 1},
+    ).to_list(length=10000)
+    by_day: Dict[str, List[int]] = {}
+    for d in docs:
+        try:
+            day = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")).date().isoformat()
+        except Exception:
+            continue
+        by_day.setdefault(day, []).append(int(d.get("intensity", 5)))
+    out = []
+    for i in range(365):
+        date = (start + timedelta(days=i)).isoformat()
+        scores = by_day.get(date)
+        avg = round(sum(scores) / len(scores), 1) if scores else None
+        out.append({"date": date, "mood_avg": avg})
+    return {"days": out}
+
+
+@api.get("/analytics/highlights")
+async def analytics_highlights(user=Depends(current_user)):
+    today = datetime.now(timezone.utc).date()
+    first = today.replace(day=1)
+    docs = await db.mood.find(
+        {"user_id": user["id"], "created_at": {"$gte": first.isoformat()}},
+        {"_id": 0, "intensity": 1, "created_at": 1},
+    ).to_list(length=5000)
+    by_day: Dict[str, List[int]] = {}
+    for d in docs:
+        try:
+            day = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")).date().isoformat()
+        except Exception:
+            continue
+        by_day.setdefault(day, []).append(int(d.get("intensity", 5)))
+    if not by_day:
+        return {"best": None, "toughest": None}
+    avgs = {day: sum(s) / len(s) for day, s in by_day.items()}
+    best_day, best_score = max(avgs.items(), key=lambda kv: kv[1])
+    tough_day, tough_score = min(avgs.items(), key=lambda kv: kv[1])
+
+    cache_key = f"highlights:{user['id']}:{today.isoformat()}"
+    cached = await db.cache.find_one({"cache_key": cache_key})
+    if cached and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
+        reasons = cached["response"]
+    else:
+        prompt = (
+            f"On {best_day} the user's mood averaged {best_score:.1f}/10 — their best this month. "
+            f"On {tough_day} it averaged {tough_score:.1f}/10 — their toughest. "
+            "Write strict JSON {best:string, toughest:string} — each a single warm sentence "
+            "noting what may have helped or hurt. Max 22 words each."
+        )
+        try:
+            raw = await llm_chat("You are a wellness pattern reader. Return strict JSON.", prompt, session_id=f"hl-{user['id']}")
+            reasons = _parse_llm_json(raw) or {"best": "A noticeably good day.", "toughest": "A heavier-than-usual day."}
+        except Exception:
+            reasons = {"best": "A noticeably good day.", "toughest": "A heavier-than-usual day."}
+        await db.cache.update_one(
+            {"cache_key": cache_key},
+            {"$set": {"cache_key": cache_key, "response": reasons,
+                      "generated_at": now_iso(),
+                      "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
+            upsert=True,
+        )
+    return {
+        "best": {"date": best_day, "score": round(best_score, 1), "reason": reasons.get("best", "")},
+        "toughest": {"date": tough_day, "score": round(tough_score, 1), "reason": reasons.get("toughest", "")},
+    }
+
+
+
     existing = await db.users.find_one({"email": "demo@mindsphere.app"})
     trial_start = datetime.now(timezone.utc)
     trial_end = trial_start + timedelta(days=TRIAL_DAYS)

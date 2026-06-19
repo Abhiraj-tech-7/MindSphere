@@ -1,14 +1,16 @@
 import React, { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Mic, MicOff, X, Send, Sparkles } from "lucide-react";
+import { Mic, MicOff, X, Send, Sparkles, Heart, BookHeart } from "lucide-react";
 import AppShell from "../components/AppShell";
 import { PageHeader } from "../components/Shared";
 import { MindOrb } from "../components/MindOrb";
 import GuidanceCard from "../components/GuidanceCard";
 import { http } from "../lib/api";
 import { toast } from "sonner";
+import GratitudeTab from "../components/GratitudeTab";
 
 const Journal = () => {
+  const [tab, setTab] = useState("journal");
   const [entries, setEntries] = useState([]);
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(null);
@@ -99,6 +101,32 @@ const Journal = () => {
         }
       />
 
+      {/* Tab switcher: Journal | Gratitude */}
+      <div className="flex gap-1 mb-5">
+        <button
+          onClick={() => setTab("journal")}
+          data-testid="journal-tab-entries"
+          className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm transition ${
+            tab === "journal" ? "bg-white/10 text-white" : "text-white/55 hover:text-white/85"
+          }`}
+        >
+          <BookHeart size={14} /> Entries
+        </button>
+        <button
+          onClick={() => setTab("gratitude")}
+          data-testid="journal-tab-gratitude"
+          className={`flex items-center gap-2 px-4 py-2 rounded-full text-sm transition ${
+            tab === "gratitude" ? "bg-amber-500/15 text-amber-200" : "text-white/55 hover:text-white/85"
+          }`}
+        >
+          <Heart size={14} /> Gratitude
+        </button>
+      </div>
+
+      {tab === "gratitude" && <GratitudeTab />}
+      {tab === "journal" && (
+      <>
+
       <div className="relative h-[60vh] glass overflow-hidden" data-testid="journal-canvas">
         {/* center big orb */}
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
@@ -157,6 +185,8 @@ const Journal = () => {
           ))}
         </div>
       </div>
+      </>
+      )}
 
       {/* New entry modal */}
       <AnimatePresence>

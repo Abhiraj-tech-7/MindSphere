@@ -7,10 +7,12 @@ import GuidanceCard from "../components/GuidanceCard";
 import { http } from "../lib/api";
 
 const SUGGESTIONS = [
-  "How am I doing this week?",
-  "I'm feeling overwhelmed",
-  "What should I focus on today?",
-  "Analyze my mood patterns",
+  "I'm feeling anxious today",
+  "Help me reframe a negative thought",
+  "I need a quick 2-minute calm-down",
+  "What does my mood data say about me?",
+  "Give me a journaling prompt",
+  "I'm struggling to sleep — any tips?",
 ];
 
 const Lyra = () => {

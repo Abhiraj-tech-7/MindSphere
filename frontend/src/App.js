@@ -6,6 +6,7 @@ import "./App.css";
 import ScrollToTop from "./components/ScrollToTop";
 import TrialBanner from "./components/TrialBanner";
 import { UpgradeProvider } from "./components/UpgradeModal";
+import { MoodWidgetProvider } from "./components/MoodWidget";
 
 import Landing from "./pages/Landing";
 import MentalHealth from "./pages/MentalHealth";
@@ -77,6 +78,7 @@ function App() {
       <AuthProvider>
         <BrowserRouter>
           <UpgradeProvider>
+            <MoodWidgetProvider>
             <ScrollToTop />
             <TitleManager />
             <TrialBanner />
@@ -107,6 +109,7 @@ function App() {
               <Route path="/app/settings" element={<Protected><SettingsPage /></Protected>} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
+            </MoodWidgetProvider>
           </UpgradeProvider>
         </BrowserRouter>
       </AuthProvider>

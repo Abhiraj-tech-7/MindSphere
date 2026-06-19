@@ -46,6 +46,7 @@ const Landing = () => {
           <div className="font-display text-xl">MindSphere</div>
         </div>
         <div className="flex items-center gap-3">
+          <Link to="/pricing" data-testid="nav-pricing" className="text-sm text-white/70 hover:text-white px-3 py-2 hidden sm:inline">Pricing</Link>
           <Link to="/auth" data-testid="nav-signin" className="text-sm text-white/70 hover:text-white px-4 py-2">Sign in</Link>
           <Link to="/auth?mode=signup" data-testid="nav-getstarted"
             className="text-sm px-5 py-2.5 rounded-full bg-white text-black hover:bg-white/90 transition font-medium">
@@ -146,8 +147,15 @@ const Landing = () => {
         ))}
       </section>
 
-      <footer className="relative z-10 border-t border-white/5 px-6 py-10 text-center text-white/40 text-xs">
-        © 2026 MindSphere · Not a substitute for clinical care. In crisis? Call or text 988 (US).
+      <footer className="relative z-10 border-t border-white/5 px-6 py-10 text-center text-white/40 text-xs space-y-2">
+        <div className="space-x-3">
+          <Link to="/pricing" data-testid="footer-pricing" className="hover:text-white/70">Pricing</Link>
+          <span>·</span>
+          <Link to="/privacy" data-testid="footer-privacy" className="hover:text-white/70">Privacy</Link>
+          <span>·</span>
+          <Link to="/terms" data-testid="footer-terms" className="hover:text-white/70">Terms</Link>
+        </div>
+        <div>© 2026 MindSphere · Not a substitute for clinical care. In crisis? Call or text 988 (US) · 1-833-456-4566 (Canada) · findahelpline.com</div>
       </footer>
     </div>
   );

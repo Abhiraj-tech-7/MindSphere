@@ -135,10 +135,26 @@ async def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(b
 def check_access(user: Dict[str, Any], feature: str) -> bool:
     """Return True if user's plan grants access to feature."""
     plan = user.get("plan", "trial")
-    if plan in ("trial", "pro"):
+    if plan == "pro":
         return True
+    if plan == "trial":
+        # Trial users get ONE chance to try each gated feature.
+        # Counters are stored in users.trial_uses (incremented at usage by gated endpoints).
+        used = (user.get("trial_uses") or {}).get(feature, 0)
+        if feature == "voice":
+            # Voice has its own time-based cap (60 seconds) — gating handled separately.
+            return True
+        return used < 1
     # free plan
     return feature in FREE_FEATURES
+
+
+async def consume_trial_use(user_id: str, feature: str):
+    """Increment a trial user's per-feature usage counter (one-time-use guard)."""
+    await db.users.update_one(
+        {"id": user_id},
+        {"$inc": {f"trial_uses.{feature}": 1}},
+    )
 
 
 def require_access(feature: str):
@@ -150,9 +166,12 @@ def require_access(feature: str):
                 detail={
                     "error": "upgrade_required",
                     "feature": feature,
-                    "message": "Upgrade to MindSphere Pro to access this feature.",
+                    "message": f"You've already used your one free try of {feature}. Upgrade to MindSphere Pro for unlimited access.",
                 },
             )
+        # If trial, consume the one-shot use now (idempotent per-feature counter)
+        if user.get("plan") == "trial" and feature != "voice":
+            await consume_trial_use(user["id"], feature)
         return user
     return _dep
 
@@ -1917,13 +1936,52 @@ async def voice_websocket(websocket: WebSocket, token: str = Query(...)):
 
 @api.get("/voice/config")
 async def voice_config(user=Depends(current_user)):
-    """Return non-secret config for the voice client."""
+    plan = user.get("plan", "trial")
+    voice_used = (user.get("trial_uses") or {}).get("voice", 0)
+    voice_cap_sec = 60 if plan == "trial" else (600 if plan == "pro" else 0)
+    if plan == "trial" and voice_used >= voice_cap_sec:
+        # Trial user has exhausted their 60s voice
+        return {
+            "model": GEMINI_LIVE_MODEL,
+            "input_sample_rate": 16000,
+            "output_sample_rate": 24000,
+            "available": False,
+            "plan": plan,
+            "voice_cap_sec": voice_cap_sec,
+            "voice_used_sec": voice_used,
+            "upgrade_required": True,
+            "message": "Your 1-minute trial of voice mode is used up. Upgrade to Pro for 10-minute sessions.",
+        }
+    if plan == "free":
+        return {
+            "model": GEMINI_LIVE_MODEL,
+            "available": False,
+            "plan": plan,
+            "upgrade_required": True,
+            "message": "Voice mode requires MindSphere Pro.",
+        }
     return {
         "model": GEMINI_LIVE_MODEL,
         "input_sample_rate": 16000,
         "output_sample_rate": 24000,
         "available": bool(GEMINI_API_KEY),
+        "plan": plan,
+        "voice_cap_sec": voice_cap_sec,
+        "voice_used_sec": voice_used,
     }
+
+
+@api.post("/voice/usage")
+async def voice_usage(payload: Dict[str, Any], user=Depends(current_user)):
+    """Frontend reports voice seconds consumed when ending a session."""
+    seconds = int(payload.get("seconds", 0))
+    if seconds <= 0:
+        return {"ok": True}
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$inc": {"trial_uses.voice": seconds}},
+    )
+    return {"ok": True}
 
 
 @api.get("/resources")

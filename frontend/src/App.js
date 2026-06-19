@@ -32,6 +32,7 @@ import PrivacyPolicy from "./pages/PrivacyPolicy";
 import Terms from "./pages/Terms";
 import Welcome from "./pages/Welcome";
 import Community from "./pages/Community";
+import ChoosePlan from "./pages/ChoosePlan";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { AIStatusProvider } from "./components/AIStatus";
 
@@ -43,6 +44,7 @@ const ROUTE_TITLES = {
   "/privacy": "Privacy Policy — MindSphere",
   "/terms": "Terms of Service — MindSphere",
   "/welcome": "Welcome — MindSphere",
+  "/choose-plan": "Choose your plan — MindSphere",
   "/app/community": "Community — MindSphere",
   "/app/dashboard": "Dashboard — MindSphere",
   "/app/journal": "Journal — MindSphere",
@@ -98,6 +100,7 @@ function App() {
               <Route path="/privacy" element={<PrivacyPolicy />} />
               <Route path="/terms" element={<Terms />} />
               <Route path="/welcome" element={<Protected needOnboarded={false}><Welcome /></Protected>} />
+              <Route path="/choose-plan" element={<Protected needOnboarded={false}><ChoosePlan /></Protected>} />
               <Route path="/onboarding" element={<Protected needOnboarded={false}><Onboarding /></Protected>} />
               <Route path="/app" element={<Navigate to="/app/dashboard" replace />} />
               <Route path="/app/dashboard" element={<Protected><Dashboard /></Protected>} />

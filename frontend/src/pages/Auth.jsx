@@ -29,7 +29,8 @@ const Auth = () => {
     try {
       if (mode === "signup") {
         const u = await register(name, email, pw);
-        nav(u.onboarded ? "/app/dashboard" : "/onboarding");
+        // After signup: plan-choice step BEFORE onboarding
+        nav("/choose-plan");
       } else {
         const u = await login(email, pw);
         nav(u.onboarded ? "/app/dashboard" : "/onboarding");
@@ -100,22 +101,14 @@ const Auth = () => {
           </button>
         </form>
 
-        <div className="mt-5 flex items-center gap-2">
-          <div className="flex-1 h-px bg-white/10" />
-          <div className="text-xs text-white/30">or</div>
-          <div className="flex-1 h-px bg-white/10" />
-        </div>
-
-        <button onClick={useDemo} data-testid="auth-demo"
-          className="mt-5 w-full py-3 rounded-2xl border border-white/10 hover:bg-white/5 text-sm transition">
-          Try the demo account
-        </button>
-
         <div className="mt-6 text-center text-sm text-white/50">
           {mode === "signup" ? "Already have one?" : "New here?"}{" "}
           <button data-testid="auth-toggle" onClick={() => setMode(mode === "signup" ? "login" : "signup")} className="text-white underline-offset-4 hover:underline">
             {mode === "signup" ? "Sign in" : "Create an account"}
           </button>
+        </div>
+        <div className="mt-3 text-center text-[11px] text-white/30">
+          By continuing you agree to our <a href="/terms" className="hover:text-white/60 underline-offset-2 underline">Terms</a> and <a href="/privacy" className="hover:text-white/60 underline-offset-2 underline">Privacy Policy</a>.
         </div>
       </motion.div>
     </div>

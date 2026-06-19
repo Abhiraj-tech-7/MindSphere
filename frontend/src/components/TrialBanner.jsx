@@ -10,17 +10,24 @@ import { useAuth } from "../lib/auth.jsx";
  * Hidden on /auth, /onboarding, /pricing, /welcome.
  * Dismissable per session via sessionStorage.
  */
-const HIDE_PATHS = ["/auth", "/onboarding", "/pricing", "/welcome"];
+const HIDE_PATHS = ["/auth", "/onboarding", "/pricing", "/welcome", "/choose-plan", "/privacy", "/terms"];
 
 const TrialBanner = () => {
   const { user } = useAuth();
   const loc = useLocation();
   const nav = useNavigate();
   const [status, setStatus] = useState(null);
+  const [now, setNow] = useState(Date.now());
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
     if (sessionStorage.getItem("ms_trial_banner_dismissed") === "1") setDismissed(true);
+  }, []);
+
+  // tick every second for live countdown
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
   }, []);
 
   useEffect(() => {
@@ -48,18 +55,29 @@ const TrialBanner = () => {
 
   const isTrial = status.plan === "trial";
   const isFree = status.plan === "free";
-  const days = status.trial_days_remaining;
+  const trialEnd = status.trial_end ? new Date(status.trial_end).getTime() : null;
+  const msLeft = trialEnd ? Math.max(0, trialEnd - now) : 0;
+  const daysLeft = Math.floor(msLeft / 86400000);
+  const hh = Math.floor((msLeft % 86400000) / 3600000);
+  const mm = Math.floor((msLeft % 3600000) / 60000);
+  const ss = Math.floor((msLeft % 60000) / 1000);
+  const pad = (n) => String(n).padStart(2, "0");
 
-  let show = false;
-  let message = "";
-  if (isTrial && days !== null && days <= 3) {
-    show = true;
-    message = days <= 0
-      ? "Your free trial has ended today — upgrade to continue using Lyra and all Pro features."
-      : `⏳ ${days} day${days === 1 ? "" : "s"} left in your free trial — unlock everything for $14.99/month`;
+  let show = false, message = "", countdown = "";
+  if (isTrial && trialEnd) {
+    if (daysLeft <= 3) {
+      show = true;
+      if (msLeft === 0) message = "Your free trial has ended — upgrade now to keep Lyra and Pro features.";
+      else {
+        message = `⏳ Trial ends in `;
+        countdown = daysLeft > 0
+          ? `${daysLeft}d ${pad(hh)}:${pad(mm)}:${pad(ss)}`
+          : `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
+      }
+    }
   } else if (isFree) {
     show = true;
-    message = "Your free trial has ended — upgrade to continue using Lyra and all Pro features.";
+    message = "Your free trial has ended — upgrade to continue using Lyra and Pro features.";
   }
 
   if (!show) return null;
@@ -74,7 +92,10 @@ const TrialBanner = () => {
         style={{ background: "linear-gradient(90deg, #fbbf24, #f97316)" }}
         data-testid="trial-banner"
       >
-        <span className="font-medium text-center text-xs sm:text-sm">{message}</span>
+        <span className="font-medium text-center text-xs sm:text-sm">
+          {message}
+          {countdown && <span className="ml-2 font-mono tabular-nums bg-black/15 px-2 py-0.5 rounded text-xs">{countdown}</span>}
+        </span>
         <button
           onClick={() => nav("/pricing")}
           data-testid="trial-banner-cta"

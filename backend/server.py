@@ -23,8 +23,7 @@ import jwt
 import openai
 import stripe
 import resend
-
-from google import genai as google_genai
+from google import genai
 from google.genai import types as gtypes
 
 # ---------- bootstrap ----------

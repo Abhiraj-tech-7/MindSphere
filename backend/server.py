@@ -72,8 +72,13 @@ STRIPE_PRICE_ANNUAL = os.environ.get("STRIPE_PRICE_ANNUAL", "")
 resend.api_key = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "info@mindsphere.fit")
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client[DB_NAME]
+import certifi
+
+client = AsyncIOMotorClient(
+    os.environ["MONGO_URL"],
+    tlsCAFile=certifi.where()
+)
+db = client[os.environ["DB_NAME"]]
 
 app = FastAPI(title="MindSphere API")
 api = APIRouter(prefix="/api")

@@ -9,7 +9,7 @@ import { PageHeader } from "../components/Shared";
 import { toast } from "sonner";
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL;
-const WS_URL = `${BACKEND.replace(/^http/, "ws")}/api/voice/ws`;
+const url = (process.env.REACT_APP_API_URL || 'https://api.mindsphere.fit').replace(...)
 
 const QUICK_PROMPTS = ["Next step", "Repeat that", "I'm stuck", "Slower", "Done", "Show again"];
 

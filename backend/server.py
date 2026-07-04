@@ -1,4 +1,4 @@
-"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + OpenAI + Gemini Live + Stripe)."""
+"""MindSphere – mental wellness SaaS backend (FastAPI + Mongo + HuggingFace + Gemini Live + Stripe)."""
 import os
 import uuid
 import logging
@@ -20,7 +20,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 import bcrypt
 import jwt
-import openai
+from huggingface_hub import AsyncInferenceClient
 import stripe
 import resend
 from google import genai
@@ -32,35 +32,14 @@ load_dotenv(ROOT_DIR / ".env")
 
 MONGO_URL = os.environ["MONGO_URL"]
 DB_NAME = os.environ["DB_NAME"]
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGO = os.environ.get("JWT_ALGO", "HS256")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
 
-# OpenAI key rotation pool
-try:
-    OPENAI_KEY_POOL = json.loads(os.environ.get("OPENAI_KEY_POOL", "[]"))
-except Exception:
-    OPENAI_KEY_POOL = []
-if not OPENAI_KEY_POOL and os.environ.get("OPENAI_API_KEY"):
-    OPENAI_KEY_POOL = [os.environ["OPENAI_API_KEY"]]
-_openai_idx = 0
-_openai_key_failures: Dict[int, float] = {}  # index -> failed_at ts
-
-def _next_openai_key() -> Optional[str]:
-    """Return current OpenAI key, skipping ones that failed in last 60s."""
-    global _openai_idx
-    if not OPENAI_KEY_POOL:
-        return None
-    n = len(OPENAI_KEY_POOL)
-    for _ in range(n):
-        idx = _openai_idx % n
-        failed_at = _openai_key_failures.get(idx, 0)
-        if time.time() - failed_at > 60:
-            return OPENAI_KEY_POOL[idx]
-        _openai_idx += 1
-    return None
+# HuggingFace Inference API
+HF_API_KEY = os.environ.get("HF_API_KEY", "")
+HF_MODEL = os.environ.get("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 # Stripe
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
@@ -84,8 +63,7 @@ app = FastAPI(title="MindSphere API")
 api = APIRouter(prefix="/api")
 bearer = HTTPBearer(auto_error=False)
 
-LLM_MODEL = ("openai", "gpt-4o")
-LLM_VISION_MODEL = ("openai", "gpt-4o")
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("mindsphere")
@@ -271,69 +249,34 @@ EMOTION_COLOR = {
 }
 
 
-# ---------- LLM (Official OpenAI SDK with key rotation) ----------
+# ---------- LLM (HuggingFace Inference API) ----------
 async def llm_chat(system: str, user_text: str, session_id: str = "default", images: List[str] = None) -> str:
-    """OpenAI chat with 15s timeout, key rotation pool, and graceful fallback."""
-    model = "gpt-4o" if images else "gpt-4o-mini"
-    content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
-    if images:
-        for img in images:
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}})
-
-    global _openai_idx
-    n = len(OPENAI_KEY_POOL)
-    if n == 0:
-        log.error("No OpenAI keys configured")
+    """HuggingFace Inference API chat with 30s timeout."""
+    if not HF_API_KEY:
+        log.error("No HuggingFace API key configured")
         return "MindSphere's AI is taking a short break — we'll be back in a few minutes. Your data is safe."
 
-    last_err: Optional[Exception] = None
-    for attempt in range(min(n, 3)):
-        key = _next_openai_key()
-        if not key:
-            break
-        try:
-            cli = openai.AsyncOpenAI(api_key=key)
-            resp = await asyncio.wait_for(
-                cli.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": content},
-                    ],
-                    max_tokens=1500,
-                ),
-                timeout=15.0,
-            )
-            return resp.choices[0].message.content or ""
-        except asyncio.TimeoutError:
-            log.warning("llm_chat timeout session=%s", session_id)
-            return "Lyra is taking a breath — please try again in a moment."
-        except (openai.RateLimitError, openai.AuthenticationError) as e:
-            log.warning("OpenAI key idx=%s failed (%s); rotating", _openai_idx % n, type(e).__name__)
-            _openai_key_failures[_openai_idx % n] = time.time()
-            _openai_idx += 1
-            last_err = e
-            continue
-        except Exception as e:
-            log.exception("llm_chat error session=%s", session_id)
-            return f"Lyra is briefly resting. Please try again. ({str(e)[:80]})"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_text},
+    ]
 
-    log.error("All OpenAI keys exhausted: %s", last_err)
-    # Emergency fallback: use Emergent LLM key via legacy wrapper so the app stays functional
-    if EMERGENT_LLM_KEY:
-        try:
-            from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
-            log.warning("Falling back to EMERGENT_LLM_KEY (OpenAI quota exhausted)")
-            chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=session_id, system_message=system).with_model(*LLM_MODEL)
-            if images:
-                chat = chat.with_model(*LLM_VISION_MODEL)
-                msg = UserMessage(text=user_text, file_contents=[ImageContent(image_base64=i) for i in images])
-            else:
-                msg = UserMessage(text=user_text)
-            return await asyncio.wait_for(chat.send_message(msg), timeout=15.0)
-        except Exception as e:
-            log.exception("Emergent fallback also failed")
-    return "MindSphere's AI is taking a short break — we'll be back in a few minutes. Your data is safe."
+    try:
+        hf_client = AsyncInferenceClient(model=HF_MODEL, token=HF_API_KEY)
+        resp = await asyncio.wait_for(
+            hf_client.chat_completion(
+                messages=messages,
+                max_tokens=1500,
+            ),
+            timeout=30.0,
+        )
+        return resp.choices[0].message.content or ""
+    except asyncio.TimeoutError:
+        log.warning("llm_chat timeout session=%s", session_id)
+        return "Lyra is taking a breath — please try again in a moment."
+    except Exception as e:
+        log.exception("llm_chat error session=%s", session_id)
+        return f"Lyra is briefly resting. Please try again. ({str(e)[:80]})"
 
 
 # ---------- Plan / Trial logic ----------
@@ -2954,7 +2897,7 @@ async def mood_forecast(user=Depends(current_user)):
 
 @api.get("/ai/health")
 async def ai_health(user=Depends(current_user)):
-    return {"status": "ok", "openai_keys": len(OPENAI_KEY_POOL), "gemini_keys": 1 if GEMINI_API_KEY else 0}
+    return {"status": "ok", "hf_key_set": bool(HF_API_KEY), "gemini_keys": 1 if GEMINI_API_KEY else 0}
 
 
 # ============================================================
@@ -3160,4 +3103,3 @@ async def _start_scheduler():
     _scheduler.add_job(_job_weekly_digest, "cron", day_of_week="sun", hour=8, minute=0, id="weekly_digest")
     _scheduler.start()
     log.info("APScheduler started: trial_warn, trial_expired, weekly_digest")
-

@@ -8,14 +8,14 @@ import {
 } from "lucide-react";
 
 const features = [
-  { icon: BookOpen, title: "AI Mind Journal", desc: "Floating thought-bubbles that learn your emotional weather.", color: "#c084fc" },
-  { icon: Smile, title: "Mood Bubble Tracker", desc: "Pretty orbs that map your inner sky day by day.", color: "#ec4899" },
-  { icon: Mic, title: "Real-Time AI Voice", desc: "Talk to Lyra like a friend — she actually listens.", color: "#10b981" },
-  { icon: Salad, title: "Personalized Diet", desc: "Meal plans tuned to your mood, not just your macros.", color: "#14b8a6" },
-  { icon: ClipboardList, title: "Mental Health Assessments", desc: "PHQ-9, GAD-7, PSS and more — beautifully gentle.", color: "#60a5fa" },
-  { icon: Activity, title: "Exercise & Movement", desc: "Workouts that match your energy, not punish it.", color: "#f59e0b" },
-  { icon: Calendar, title: "Appointment Scheduler", desc: "Therapist-ready, with talking points generated for you.", color: "#22d3ee" },
-  { icon: Search, title: "Disturbance Detector", desc: "AI quietly notices your patterns before you do.", color: "#ef4444" },
+  { icon: BookOpen, title: "AI Mind Journal", desc: "Floating thought-bubbles that learn your emotional weather.", color: "#c084fc", video: "journal" },
+  { icon: Smile, title: "Mood Bubble Tracker", desc: "Pretty orbs that map your inner sky day by day.", color: "#ec4899", video: "mood" },
+  { icon: Mic, title: "Real-Time AI Voice", desc: "Talk to Lyra like a friend — she actually listens.", color: "#10b981", video: "voice" },
+  { icon: Salad, title: "Personalized Diet", desc: "Meal plans tuned to your mood, not just your macros.", color: "#14b8a6", video: "diet" },
+  { icon: ClipboardList, title: "Mental Health Assessments", desc: "PHQ-9, GAD-7, PSS and more — beautifully gentle.", color: "#60a5fa", video: "assessments" },
+  { icon: Activity, title: "Exercise & Movement", desc: "Workouts that match your energy, not punish it.", color: "#f59e0b", video: "exercise" },
+  { icon: Calendar, title: "Appointment Scheduler", desc: "Therapist-ready, with talking points generated for you.", color: "#22d3ee", video: "appointments" },
+  { icon: Search, title: "Disturbance Detector", desc: "AI quietly notices your patterns before you do.", color: "#ef4444", video: "disturbance" },
 ];
 
 const Counter = ({ to, suffix = "", duration = 1.6 }) => {
@@ -36,6 +36,21 @@ const Counter = ({ to, suffix = "", duration = 1.6 }) => {
 };
 
 const Landing = () => {
+  const startFeatureVideo = (e) => {
+    const video = e.currentTarget.querySelector("video");
+    if (!video) return;
+    video.currentTime = 0;
+    const playRequest = video.play();
+    if (playRequest?.catch) playRequest.catch(() => {});
+  };
+
+  const stopFeatureVideo = (e) => {
+    const video = e.currentTarget.querySelector("video");
+    if (!video) return;
+    video.pause();
+    video.currentTime = 0;
+  };
+
   return (
     <div className="relative min-h-screen bg-black text-white overflow-hidden">
       <AuroraBackground />
@@ -91,14 +106,25 @@ const Landing = () => {
               viewport={{ once: true }}
               transition={{ delay: i * 0.06 }}
               whileHover={{ y: -10, scale: 1.02 }}
+              onMouseEnter={startFeatureVideo}
+              onMouseLeave={stopFeatureVideo}
               className="glass p-6 group cursor-default relative overflow-hidden"
               style={{ borderColor: `${f.color}33` }}
               data-testid={`feature-${i}`}
             >
+              <video
+                className="absolute inset-0 h-full w-full object-cover opacity-0 transition-opacity duration-300 pointer-events-none group-hover:opacity-100"
+                src={`${process.env.PUBLIC_URL || ""}/feature-videos/${f.video}.mp4`}
+                muted
+                loop
+                playsInline
+                preload="metadata"
+                aria-hidden="true"
+              />
               <div className="absolute -inset-1 opacity-0 group-hover:opacity-100 transition pointer-events-none" style={{
                 background: `radial-gradient(circle at 50% 0%, ${f.color}33, transparent 60%)`,
               }} />
-              <div className="relative">
+              <div className="relative group-hover:opacity-0 transition-opacity duration-200">
                 <motion.div whileHover={{ rotate: 15, scale: 1.1 }} className="w-11 h-11 rounded-2xl flex items-center justify-center mb-4"
                   style={{ background: `${f.color}22`, boxShadow: `0 0 30px ${f.color}33` }}>
                   <f.icon size={20} style={{ color: f.color }} />

@@ -24,17 +24,31 @@ if (config.enableHealthCheck) {
 
 let webpackConfig = {
   eslint: {
-    mode: "extends",
+    mode: "file",
     configure: (eslintConfig) => {
-      // Remove deprecated ESLint 9 incompatible options
+      // Remove deprecated ESLint 9 incompatible options that react-scripts tries to add
       delete eslintConfig.extensions;
       delete eslintConfig.resolvePluginsRelativeTo;
+      delete eslintConfig.baseConfig;
       
-      // Add our custom rules
-      eslintConfig.rules = {
-        ...eslintConfig.rules,
-        "react-hooks/rules-of-hooks": "error",
-        "react-hooks/exhaustive-deps": "warn",
+      // Set up minimal ESLint 9 compatible config
+      eslintConfig.baseConfig = {
+        env: {
+          browser: true,
+          es2021: true,
+          node: true,
+        },
+        extends: ["eslint:recommended"],
+        parserOptions: {
+          ecmaFeatures: { jsx: true },
+          ecmaVersion: "latest",
+          sourceType: "module",
+        },
+        plugins: ["react", "react-hooks"],
+        rules: {
+          "react-hooks/rules-of-hooks": "error",
+          "react-hooks/exhaustive-deps": "warn",
+        },
       };
       
       return eslintConfig;
@@ -58,6 +72,22 @@ let webpackConfig = {
             '**/public/**',
         ],
       };
+
+      // Fix ESLint webpack plugin for ESLint 9 compatibility
+      // Find and reconfigure the ESLintWebpackPlugin
+      const eslintPluginIndex = webpackConfig.plugins.findIndex(
+        (plugin) => plugin.constructor.name === 'ESLintWebpackPlugin'
+      );
+      
+      if (eslintPluginIndex !== -1) {
+        const eslintPlugin = webpackConfig.plugins[eslintPluginIndex];
+        
+        // Remove deprecated options from the plugin options
+        if (eslintPlugin.options) {
+          delete eslintPlugin.options.extensions;
+          delete eslintPlugin.options.resolvePluginsRelativeTo;
+        }
+      }
 
       // Add health check plugin to webpack if enabled
       if (config.enableHealthCheck && healthPluginInstance) {

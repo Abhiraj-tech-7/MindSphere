@@ -41,6 +41,9 @@ GEMINI_LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-p
 HF_API_KEY = os.environ.get("HF_API_KEY", "")
 HF_MODEL = os.environ.get("HF_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
+# Gemini text fallback (used when HF is unavailable / out of credits)
+GEMINI_TEXT_MODEL = os.environ.get("GEMINI_TEXT_MODEL", "gemini-2.5-flash")
+
 # Stripe
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -249,34 +252,78 @@ EMOTION_COLOR = {
 }
 
 
-# ---------- LLM (HuggingFace Inference API) ----------
-async def llm_chat(system: str, user_text: str, session_id: str = "default", images: List[str] = None) -> str:
-    """HuggingFace Inference API chat with 30s timeout."""
-    if not HF_API_KEY:
-        log.error("No HuggingFace API key configured")
-        return "MindSphere's AI is taking a short break — we'll be back in a few minutes. Your data is safe."
+# ---------- LLM (HuggingFace Inference API, with Gemini text fallback) ----------
+LLM_ERROR_MARKERS = (
+    "Lyra is briefly resting",
+    "Lyra is taking a breath",
+    "MindSphere's AI is taking a short break",
+)
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_text},
-    ]
 
+def is_llm_error(text: Optional[str]) -> bool:
+    """True if `text` is one of llm_chat's own failure placeholders (not a real model reply)."""
+    if not text:
+        return True
+    return any(marker in text for marker in LLM_ERROR_MARKERS)
+
+
+async def _gemini_text_fallback(system: str, user_text: str) -> Optional[str]:
+    """Best-effort fallback to Gemini text generation when HuggingFace is unavailable.
+    Returns None (never raises) if Gemini isn't configured or also fails."""
+    if not GEMINI_API_KEY:
+        return None
     try:
-        hf_client = AsyncInferenceClient(model=HF_MODEL, token=HF_API_KEY)
+        g_client = genai.Client(api_key=GEMINI_API_KEY)
         resp = await asyncio.wait_for(
-            hf_client.chat_completion(
-                messages=messages,
-                max_tokens=1500,
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: g_client.models.generate_content(
+                    model=GEMINI_TEXT_MODEL,
+                    contents=user_text,
+                    config=gtypes.GenerateContentConfig(system_instruction=system),
+                ),
             ),
-            timeout=30.0,
+            timeout=20.0,
         )
-        return resp.choices[0].message.content or ""
-    except asyncio.TimeoutError:
-        log.warning("llm_chat timeout session=%s", session_id)
-        return "Lyra is taking a breath — please try again in a moment."
-    except Exception as e:
-        log.exception("llm_chat error session=%s", session_id)
-        return f"Lyra is briefly resting. Please try again. ({str(e)[:80]})"
+        return (resp.text or "").strip() or None
+    except Exception:
+        log.exception("gemini text fallback failed")
+        return None
+
+
+async def llm_chat(system: str, user_text: str, session_id: str = "default", images: List[str] = None) -> str:
+    """HuggingFace Inference API chat with 30s timeout. Falls back to Gemini on failure."""
+    if HF_API_KEY:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text},
+        ]
+        try:
+            hf_client = AsyncInferenceClient(model=HF_MODEL, token=HF_API_KEY)
+            resp = await asyncio.wait_for(
+                hf_client.chat_completion(
+                    messages=messages,
+                    max_tokens=1500,
+                ),
+                timeout=30.0,
+            )
+            content = resp.choices[0].message.content or ""
+            if content.strip():
+                return content
+            log.warning("llm_chat: HF returned empty content, trying Gemini fallback session=%s", session_id)
+        except asyncio.TimeoutError:
+            log.warning("llm_chat timeout session=%s, trying Gemini fallback", session_id)
+        except Exception as e:
+            log.warning("llm_chat HF error session=%s: %s — trying Gemini fallback", session_id, str(e)[:200])
+    else:
+        log.error("No HuggingFace API key configured — trying Gemini fallback")
+
+    # HF failed, timed out, returned empty, or isn't configured — try Gemini before giving up.
+    fallback = await _gemini_text_fallback(system, user_text)
+    if fallback:
+        return fallback
+
+    return "Lyra is briefly resting. Please try again in a moment."
 
 
 # ---------- Plan / Trial logic ----------
@@ -1221,15 +1268,20 @@ async def disturbance_vision(req: VisionAnalyzeReq, user=Depends(require_access(
 async def dashboard(user=Depends(current_user)):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     name = user.get("name", "friend").split(" ")[0]
-    # affirmation
+    # affirmation (only cache successful generations — never cache llm_chat's own error placeholder)
     aff_doc = await db.affirmations.find_one({"user_id": user["id"], "date": today}, {"_id": 0})
-    if not aff_doc:
+    if not aff_doc or is_llm_error(aff_doc.get("text")):
         aff = await llm_chat(
             "Write one short (max 18 words), poetic daily affirmation for a wellness app user, second person. No quotes.",
             f"User name {name}.",
             session_id=f"aff-{user['id']}-{today}",
         )
-        await db.affirmations.insert_one({"id": new_id(), "user_id": user["id"], "date": today, "text": aff})
+        if not is_llm_error(aff):
+            await db.affirmations.update_one(
+                {"user_id": user["id"], "date": today},
+                {"$set": {"id": new_id(), "user_id": user["id"], "date": today, "text": aff}},
+                upsert=True,
+            )
         aff_doc = {"date": today, "text": aff}
     # latest mood
     latest_mood = await db.mood.find_one({"user_id": user["id"]}, {"_id": 0}, sort=[("created_at", -1)])
@@ -1255,16 +1307,21 @@ async def dashboard(user=Depends(current_user)):
     if week_moods:
         avg = sum(m.get("intensity", 5) for m in week_moods) / len(week_moods)
     score = min(100, int(avg * 10) + min(20, len(journals) * 2))
-    # insight
+    # insight (same fix: don't persist a failed generation)
     insight_doc = await db.insights.find_one({"user_id": user["id"], "date": today}, {"_id": 0})
-    if not insight_doc:
+    if not insight_doc or is_llm_error(insight_doc.get("text")):
         snippet = "; ".join([f"({j.get('emotion')}) {j.get('content','')[:60]}" for j in journals[:3]]) or "no entries yet"
         insight_text = await llm_chat(
             "Write one personal mental wellness tip (max 24 words) for the user based on their recent journal, second person.",
             f"Recent journal: {snippet}.",
             session_id=f"insight-{user['id']}-{today}",
         )
-        await db.insights.insert_one({"id": new_id(), "user_id": user["id"], "date": today, "text": insight_text})
+        if not is_llm_error(insight_text):
+            await db.insights.update_one(
+                {"user_id": user["id"], "date": today},
+                {"$set": {"id": new_id(), "user_id": user["id"], "date": today, "text": insight_text}},
+                upsert=True,
+            )
         insight_doc = {"date": today, "text": insight_text}
     # stress heatmap (30d)
     heat = []
@@ -2434,10 +2491,10 @@ async def wellness_score(user=Depends(current_user)):
     diff = score - yest_s["score"]
     trend = "up" if diff >= 5 else ("down" if diff <= -5 else "flat")
 
-    # AI insight cache (6h)
+    # AI insight cache (6h) — never persist llm_chat's own failure placeholder
     cache_key = f"insight:{user['id']}:{today}:{score}"
     cached = await db.cache.find_one({"cache_key": cache_key})
-    if cached and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
+    if cached and not is_llm_error(cached.get("response")) and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
         insight = cached["response"]
     else:
         prompt = (
@@ -2451,15 +2508,16 @@ async def wellness_score(user=Depends(current_user)):
             insight = (await llm_chat("You are a warm wellness coach. One sentence only.", prompt, session_id=f"insight-{user['id']}")).strip()
         except Exception:
             insight = "Each small win counts — keep going."
-        await db.cache.update_one(
-            {"cache_key": cache_key},
-            {"$set": {
-                "cache_key": cache_key, "response": insight,
-                "generated_at": now_iso(),
-                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
-            }},
-            upsert=True,
-        )
+        if not is_llm_error(insight):
+            await db.cache.update_one(
+                {"cache_key": cache_key},
+                {"$set": {
+                    "cache_key": cache_key, "response": insight,
+                    "generated_at": now_iso(),
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat(),
+                }},
+                upsert=True,
+            )
 
     return {
         "score": score,
@@ -2512,7 +2570,7 @@ async def gratitude_weekly_reflection(user=Depends(current_user)):
                 "message": "Log gratitude for a few more days to unlock your weekly reflection."}
     cache_key = f"grat-week:{user['id']}:{_today_str()}"
     cached = await db.cache.find_one({"cache_key": cache_key})
-    if cached and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
+    if cached and not is_llm_error(cached.get("response")) and _parse_iso(cached.get("expires_at")) and datetime.now(timezone.utc) < _parse_iso(cached["expires_at"]):
         return {"reflection": cached["response"]}
     flat = []
     for entry in recent:
@@ -2527,13 +2585,14 @@ async def gratitude_weekly_reflection(user=Depends(current_user)):
         reflection = (await llm_chat("You are a warm wellness reflector.", prompt, session_id=f"grat-{user['id']}")).strip()
     except Exception:
         reflection = "Your week is full of small, real beauty. Keep collecting these moments."
-    await db.cache.update_one(
-        {"cache_key": cache_key},
-        {"$set": {"cache_key": cache_key, "response": reflection,
-                  "generated_at": now_iso(),
-                  "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
-        upsert=True,
-    )
+    if not is_llm_error(reflection):
+        await db.cache.update_one(
+            {"cache_key": cache_key},
+            {"$set": {"cache_key": cache_key, "response": reflection,
+                      "generated_at": now_iso(),
+                      "expires_at": (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()}},
+            upsert=True,
+        )
     return {"reflection": reflection}
 
 
